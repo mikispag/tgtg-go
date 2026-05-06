@@ -1481,13 +1481,7 @@ func TestNewAppliesDefaults(t *testing.T) {
 	}
 }
 
-func TestNewFallsBackOnAPKVersionFetchFailure(t *testing.T) {
-	// Override DefaultAPKVersionSources by passing UserAgent="" with an
-	// unreachable APKVersion source list... but our public surface doesn't
-	// expose a swap. Instead, just confirm the fallback path runs by setting
-	// an obviously broken APKVersion-fetch shortcut: pre-set APKVersion via
-	// Config. (The "real" fallback codepath is exercised by GetLastAPKVersion
-	// tests in apk_test.go.)
+func TestNewBuildsUserAgentEagerlyWhenAPKVersionGiven(t *testing.T) {
 	c := New(Config{
 		AccessToken:  "a",
 		RefreshToken: "r",
@@ -1662,5 +1656,135 @@ func TestGetItemsRequestBody(t *testing.T) {
 	}
 	if body["page_size"].(float64) != 20 {
 		t.Fatalf("page_size default should be 20, got %v", body["page_size"])
+	}
+}
+
+// --- Lazy User-Agent resolution -------------------------------------------
+
+func TestNewDefersUserAgentWhenNoAPKVersionGiven(t *testing.T) {
+	c := New(Config{
+		AccessToken:  "a",
+		RefreshToken: "r",
+		Cookie:       "c",
+		Output:       io.Discard,
+	})
+	if c.UserAgent != "" {
+		t.Fatalf("UserAgent should be empty until first request, got %q", c.UserAgent)
+	}
+}
+
+func TestPostLazilyResolvesUserAgent(t *testing.T) {
+	m := newMockServer(t)
+	m.addRefreshTokensResponse()
+	gotUA := make(chan string, 1)
+	m.routes = append(m.routes, &route{
+		method: http.MethodPost,
+		path:   "/" + APIItemEndpoint,
+		calls:  new(int64),
+		handler: func(w http.ResponseWriter, r *http.Request) {
+			gotUA <- r.Header.Get("User-Agent")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}})
+		},
+	})
+
+	c := New(Config{
+		AccessToken:    "access_token",
+		RefreshToken:   "refresh_token",
+		Cookie:         "cookie",
+		URL:            m.baseURL(),
+		DataDomeSDKURL: m.server.URL + "/datadome",
+		Output:         io.Discard,
+		Sleep:          func(time.Duration) {},
+		APKVersionFetcher: func(context.Context) (string, error) {
+			return "99.88.77", nil
+		},
+	})
+	if c.UserAgent != "" {
+		t.Fatalf("UserAgent should defer resolution, got %q", c.UserAgent)
+	}
+	if _, err := c.GetItems(context.Background(), DefaultGetItemsOptions()); err != nil {
+		t.Fatalf("GetItems: %v", err)
+	}
+	got := <-gotUA
+	if !strings.Contains(got, "99.88.77") {
+		t.Fatalf("UserAgent header should embed fetched version, got %q", got)
+	}
+	if !strings.Contains(c.UserAgent, "99.88.77") {
+		t.Fatalf("c.UserAgent should be populated after first request, got %q", c.UserAgent)
+	}
+}
+
+func TestPostUsesRequestContextForAPKFetch(t *testing.T) {
+	m := newMockServer(t)
+	m.addRefreshTokensResponse()
+
+	type ctxKey struct{}
+	seen := make(chan context.Context, 1)
+	c := New(Config{
+		AccessToken:    "access_token",
+		RefreshToken:   "refresh_token",
+		Cookie:         "cookie",
+		URL:            m.baseURL(),
+		DataDomeSDKURL: m.server.URL + "/datadome",
+		Output:         io.Discard,
+		Sleep:          func(time.Duration) {},
+		APKVersionFetcher: func(ctx context.Context) (string, error) {
+			seen <- ctx
+			return DefaultAPKVersion, nil
+		},
+	})
+	ctx := context.WithValue(context.Background(), ctxKey{}, "marker")
+	if err := c.Login(ctx); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	select {
+	case got := <-seen:
+		if got.Value(ctxKey{}) != "marker" {
+			t.Fatalf("APK fetcher should receive request ctx; got value %v", got.Value(ctxKey{}))
+		}
+	default:
+		t.Fatalf("APK fetcher was not invoked")
+	}
+}
+
+func TestPostFallsBackToDefaultAPKVersionOnFetchError(t *testing.T) {
+	m := newMockServer(t)
+	m.addRefreshTokensResponse()
+
+	c := New(Config{
+		AccessToken:    "access_token",
+		RefreshToken:   "refresh_token",
+		Cookie:         "cookie",
+		URL:            m.baseURL(),
+		DataDomeSDKURL: m.server.URL + "/datadome",
+		Output:         io.Discard,
+		Sleep:          func(time.Duration) {},
+		APKVersionFetcher: func(context.Context) (string, error) {
+			return "", errors.New("offline")
+		},
+	})
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if !strings.Contains(c.UserAgent, DefaultAPKVersion) {
+		t.Fatalf("expected fallback to DefaultAPKVersion, got %q", c.UserAgent)
+	}
+}
+
+// --- stdin PIN reader writer routing --------------------------------------
+
+func TestStdinPinReaderUsesProvidedWriter(t *testing.T) {
+	var out strings.Builder
+	in := strings.NewReader("4321\n")
+	pin, err := stdinPinReader(&out, in)
+	if err != nil {
+		t.Fatalf("stdinPinReader: %v", err)
+	}
+	if !strings.Contains(out.String(), "Enter PIN from email") {
+		t.Fatalf("prompt should be written to provided writer, got %q", out.String())
+	}
+	if strings.TrimSpace(pin) != "4321" {
+		t.Fatalf("pin: got %q, want 4321", pin)
 	}
 }

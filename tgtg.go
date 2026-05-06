@@ -106,6 +106,11 @@ type Config struct {
 	Sleep func(time.Duration)
 	// Output controls where login progress messages are written. Defaults to os.Stdout.
 	Output io.Writer
+	// APKVersionFetcher fetches the latest TooGoodToGo APK version. It is
+	// invoked lazily on the first request when neither UserAgent nor APKVersion
+	// is supplied, and receives the request's context. Defaults to
+	// GetLastAPKVersion.
+	APKVersionFetcher func(ctx context.Context) (string, error)
 }
 
 // Client talks to the TooGoodToGo API.
@@ -123,13 +128,14 @@ type Client struct {
 	LastTimeTokenRefreshed time.Time
 	Timeout                time.Duration
 
-	correlationID  string
-	httpClient     *http.Client
-	dataDomeSDKURL string
-	pinReader      func() (string, error)
-	now            func() time.Time
-	sleep          func(time.Duration)
-	out            io.Writer
+	correlationID     string
+	httpClient        *http.Client
+	dataDomeSDKURL    string
+	pinReader         func() (string, error)
+	now               func() time.Time
+	sleep             func(time.Duration)
+	out               io.Writer
+	apkVersionFetcher func(ctx context.Context) (string, error)
 }
 
 // New creates a Client using cfg, applying defaults for unset fields.
@@ -158,8 +164,14 @@ func New(cfg Config) *Client {
 	if cfg.Output == nil {
 		cfg.Output = os.Stdout
 	}
+	if cfg.APKVersionFetcher == nil {
+		cfg.APKVersionFetcher = GetLastAPKVersion
+	}
 	if cfg.PinReader == nil {
-		cfg.PinReader = stdinPinReader
+		out := cfg.Output
+		cfg.PinReader = func() (string, error) {
+			return stdinPinReader(out, os.Stdin)
+		}
 	}
 
 	httpClient := cfg.HTTPClient
@@ -185,24 +197,34 @@ func New(cfg Config) *Client {
 		LastTimeTokenRefreshed: cfg.LastTimeTokenRefreshed,
 		Timeout:                cfg.Timeout,
 
-		correlationID:  newUUID(),
-		httpClient:     httpClient,
-		dataDomeSDKURL: cfg.DataDomeSDKURL,
-		pinReader:      cfg.PinReader,
-		now:            cfg.Now,
-		sleep:          cfg.Sleep,
-		out:            cfg.Output,
+		correlationID:     newUUID(),
+		httpClient:        httpClient,
+		dataDomeSDKURL:    cfg.DataDomeSDKURL,
+		pinReader:         cfg.PinReader,
+		now:               cfg.Now,
+		sleep:             cfg.Sleep,
+		out:               cfg.Output,
+		apkVersionFetcher: cfg.APKVersionFetcher,
 	}
 
-	if c.UserAgent == "" {
-		c.UserAgent = c.makeUserAgent()
+	// When the APK version is already known, build the User-Agent eagerly —
+	// no I/O is required. Otherwise defer resolution to the first request,
+	// where the caller's context governs the APK version fetch.
+	if c.UserAgent == "" && c.APKVersion != "" {
+		c.resolveUserAgent(context.Background())
 	}
 	return c
 }
 
-func (c *Client) makeUserAgent() string {
+// resolveUserAgent populates c.UserAgent if not already set. When APKVersion
+// is empty, it fetches the latest version using ctx, falling back to
+// DefaultAPKVersion on failure.
+func (c *Client) resolveUserAgent(ctx context.Context) {
+	if c.UserAgent != "" {
+		return
+	}
 	if c.APKVersion == "" {
-		v, err := GetLastAPKVersion(context.Background())
+		v, err := c.apkVersionFetcher(ctx)
 		if err != nil {
 			c.APKVersion = DefaultAPKVersion
 			fmt.Fprintln(c.out, "Failed to get last version")
@@ -212,7 +234,7 @@ func (c *Client) makeUserAgent() string {
 	}
 	fmt.Fprintf(c.out, "Using version %s\n", c.APKVersion)
 	tmpl := userAgentTemplates[mathrand.IntN(len(userAgentTemplates))]
-	return fmt.Sprintf(tmpl, c.APKVersion)
+	c.UserAgent = fmt.Sprintf(tmpl, c.APKVersion)
 }
 
 func (c *Client) buildHeaders() http.Header {
@@ -243,6 +265,7 @@ func (c *Client) urlFor(path string) string {
 // post sends a POST with JSON body, ensuring a DataDome cookie is attempted
 // and retrying once with a fresh cookie on a 403.
 func (c *Client) post(ctx context.Context, requestURL string, body any) (httpResponse, error) {
+	c.resolveUserAgent(ctx)
 	c.ensureDataDomeCookie(ctx, requestURL)
 	res, err := c.doPost(ctx, requestURL, body)
 	if err != nil {
@@ -928,10 +951,10 @@ func (c *Client) GetManufacturerItems(ctx context.Context) (map[string]any, erro
 	return out, nil
 }
 
-// stdinPinReader reads a line from stdin after prompting on stdout.
-func stdinPinReader() (string, error) {
-	fmt.Fprint(os.Stdout, "Enter PIN from email: ")
-	r := bufio.NewReader(os.Stdin)
+// stdinPinReader prompts on out and reads a line from in.
+func stdinPinReader(out io.Writer, in io.Reader) (string, error) {
+	fmt.Fprint(out, "Enter PIN from email: ")
+	r := bufio.NewReader(in)
 	line, err := r.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", err
