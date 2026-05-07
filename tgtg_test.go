@@ -1,6 +1,8 @@
 package tgtg
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1786,5 +1788,57 @@ func TestStdinPinReaderUsesProvidedWriter(t *testing.T) {
 	}
 	if strings.TrimSpace(pin) != "4321" {
 		t.Fatalf("pin: got %q, want 4321", pin)
+	}
+}
+
+// --- gzipped response decoding --------------------------------------------
+
+// gzipBytes returns the gzip-compressed encoding of payload.
+func gzipBytes(t *testing.T, payload []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write(payload); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestRefreshTokenWithGzippedBody is a regression test for the case where the
+// API responds with Content-Encoding: gzip. Because the client sets
+// Accept-Encoding manually, Go's net/http does not transparently decode the
+// body, so doPost has to gunzip itself.
+func TestRefreshTokenWithGzippedBody(t *testing.T) {
+	m := newMockServer(t)
+	body, err := json.Marshal(map[string]any{
+		"access_token":  "gzipped_access_token",
+		"refresh_token": "gzipped_refresh_token",
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	gzipped := gzipBytes(t, body)
+	m.routes = append(m.routes, &route{
+		method: http.MethodPost,
+		path:   "/" + RefreshEndpoint,
+		calls:  new(int64),
+		handler: func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Set-Cookie", "sweet sweet cookie")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(gzipped)
+		},
+	})
+
+	c := newClient(t, m, fakeTokensConfig())
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	if c.AccessToken != "gzipped_access_token" || c.RefreshToken != "gzipped_refresh_token" {
+		t.Fatalf("tokens not decoded from gzip: %+v", c)
 	}
 }

@@ -4,6 +4,7 @@ package tgtg
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -301,7 +302,16 @@ func (c *Client) doPost(ctx context.Context, requestURL string, body any) (httpR
 		return httpResponse{}, err
 	}
 	defer resp.Body.Close()
-	payload, err := io.ReadAll(resp.Body)
+	var bodyReader io.Reader = resp.Body
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gz, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return httpResponse{}, fmt.Errorf("gzip reader: %w", err)
+		}
+		defer gz.Close()
+		bodyReader = gz
+	}
+	payload, err := io.ReadAll(bodyReader)
 	if err != nil {
 		return httpResponse{}, fmt.Errorf("read response body: %w", err)
 	}
