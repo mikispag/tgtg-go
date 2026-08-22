@@ -411,7 +411,7 @@ func (c *Client) fetchDataDomeCookie(ctx context.Context, requestURL string) {
 		Value:  m[1],
 		Domain: apiURL.Hostname(),
 		Path:   "/",
-		Secure: true,
+		Secure: apiURL.Scheme == "https",
 	}})
 }
 
