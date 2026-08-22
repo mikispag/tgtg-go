@@ -130,7 +130,7 @@ Single package. Files:
 
 ### API versions in use
 
-Auth `v5`, items `v8`, orders `v8`, token refresh `v1`, favorites `v1`,
+Auth `v5`, items `v9`, orders `v8`, token refresh `v1`, favorites `v1`,
 discover `v1`. Bump in lockstep when TooGoodToGo rolls a new version.
 
 ## Testing

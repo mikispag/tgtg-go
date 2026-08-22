@@ -369,7 +369,7 @@ func TestGetItemSuccessWithData(t *testing.T) {
 		"name":            "Test Item",
 		"items_available": float64(5),
 	}
-	m.addJSON(http.MethodPost, "/item/v8/123", http.StatusOK, itemData, nil)
+	m.addJSON(http.MethodPost, "/item/v9/123", http.StatusOK, itemData, nil)
 	c := newClient(t, m, fakeTokensConfig())
 
 	got, err := c.GetItem(context.Background(), "123")
@@ -1545,7 +1545,7 @@ func TestGetItemURLContainsItemID(t *testing.T) {
 	gotPath := make(chan string, 1)
 	m.routes = append(m.routes, &route{
 		method: http.MethodPost,
-		path:   "/item/v8/abc-123",
+		path:   "/item/v9/abc-123",
 		calls:  new(int64),
 		handler: func(w http.ResponseWriter, r *http.Request) {
 			gotPath <- r.URL.Path
@@ -1557,7 +1557,7 @@ func TestGetItemURLContainsItemID(t *testing.T) {
 	if _, err := c.GetItem(context.Background(), "abc-123"); err != nil {
 		t.Fatalf("GetItem: %v", err)
 	}
-	if got := <-gotPath; got != "/item/v8/abc-123" {
+	if got := <-gotPath; got != "/item/v9/abc-123" {
 		t.Fatalf("path: got %q", got)
 	}
 }

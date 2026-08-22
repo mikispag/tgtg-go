@@ -23,7 +23,7 @@ import (
 
 const (
 	BaseURL                  = "https://apptoogoodtogo.com/api/"
-	APIItemEndpoint          = "item/v8/"
+	APIItemEndpoint          = "item/v9/"
 	FavoriteItemEndpoint     = "user/favorite/v1/%s/update"
 	AuthByEmailEndpoint      = "auth/v5/authByEmail"
 	AuthPollingEndpoint      = "auth/v5/authByRequestPollingId"
