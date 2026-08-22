@@ -39,7 +39,7 @@ const (
 	ManufacturerItemEndpoint = "manufactureritem/v2"
 	DataDomeSDKURL           = "https://api-sdk.datadome.co/sdk/"
 
-	DefaultAPKVersion          = "24.11.0"
+	DefaultAPKVersion          = "26.8.0"
 	DefaultAccessTokenLifetime = 4 * time.Hour
 	MaxPollingTries            = 24
 	PollingWaitTime            = 5 * time.Second
