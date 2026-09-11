@@ -480,7 +480,9 @@ func (c *Client) refreshToken(ctx context.Context) error {
 	c.AccessToken = tok.AccessToken
 	c.RefreshToken = tok.RefreshToken
 	c.LastTimeTokenRefreshed = c.now()
-	c.Cookie = collectSetCookie(resp.Header)
+	if cookie := collectSetCookie(resp.Header); cookie != "" {
+		c.Cookie = cookie
+	}
 	return nil
 }
 
