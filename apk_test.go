@@ -1,8 +1,11 @@
 package tgtg
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -61,6 +64,25 @@ func TestExtractFromPlayStoreUnquotedFallback(t *testing.T) {
 	}
 	if got != "26.5.0" {
 		t.Fatalf("got %q, want 26.5.0", got)
+	}
+}
+
+func TestExtractFromPlayStoreRejectsIncompleteTokens(t *testing.T) {
+	for _, version := range []string{"26.5.0.1", "1.26.5.0", "v26.5.0", "26.5.0abc", "_26.5.0", "26.5.0-beta", "26.5.0+build"} {
+		t.Run(version, func(t *testing.T) {
+			body := []byte(`<script>AF_initDataCallback({key: 'ds:5', data:["` + version + `"], sideChannel: {}});</script>`)
+			if got, err := extractFromPlayStore(body); err == nil {
+				t.Fatalf("accepted incomplete token %q as %q", version, got)
+			}
+		})
+	}
+}
+
+func TestExtractFromPlayStoreUnquotedAdjacentVersions(t *testing.T) {
+	body := []byte(`<script>AF_initDataCallback({key: 'ds:5', data:[25.6.1,26.5.0,26.4.1], sideChannel: {}});</script>`)
+	got, err := extractFromPlayStore(body)
+	if err != nil || got != "26.5.0" {
+		t.Fatalf("extract = %q, %v; want latest version 26.5.0", got, err)
 	}
 }
 
@@ -154,6 +176,100 @@ func TestExtractFromAPKMirrorNoMatch(t *testing.T) {
 	_, err := extractFromAPKMirror([]byte(`<html>completely unrelated</html>`))
 	if err == nil {
 		t.Fatal("expected error on unrelated body")
+	}
+}
+
+func TestExtractFromAPKMirrorRejectsMalformedVersions(t *testing.T) {
+	for _, version := range []string{"2026.12.31", "26.5.100", "126.5.0", "26.5.0.1", "v26.5.0", "26.5.0abc"} {
+		t.Run(version, func(t *testing.T) {
+			if got, err := extractFromAPKMirror([]byte("<a>Too Good To Go " + version + "</a>")); err == nil {
+				t.Fatalf("accepted malformed version %q as %q", version, got)
+			}
+		})
+	}
+}
+
+func TestExtractFromAPKMirrorRequiresVersionInTitle(t *testing.T) {
+	body := []byte(`<a>Too Good To Go</a><span>2026.12.31</span><a>Another app 99.0.0</a><a>Too Good To Go 26.5.0</a>`)
+	got, err := extractFromAPKMirror(body)
+	if err != nil || got != "26.5.0" {
+		t.Fatalf("extract = %q, %v; want 26.5.0", got, err)
+	}
+}
+
+func TestFetchAPKVersionStopsAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := 0
+	client := &http.Client{Transport: apkRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		cancel()
+		return nil, context.Canceled
+	})}
+	_, err := fetchAPKVersion(ctx, client, []APKVersionSource{
+		{Name: "first", URL: "https://apk.invalid/first", Extract: extractFromAPKMirror},
+		{Name: "second", URL: "https://apk.invalid/second", Extract: extractFromAPKMirror},
+	})
+	if !errors.Is(err, context.Canceled) || requests != 1 {
+		t.Fatalf("fetch = %v after %d requests; want cancellation after one request", err, requests)
+	}
+}
+
+func TestFetchVersionFromSourceRejectsOversizedHTML(t *testing.T) {
+	body := strings.Repeat(" ", 8<<20) + `<a>Too Good To Go 26.5.0</a>`
+	client := &http.Client{Transport: apkRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	_, err := fetchVersionFromSource(context.Background(), client, APKVersionSource{
+		Name: "large", URL: "https://apk.invalid/", Extract: extractFromAPKMirror,
+	})
+	if err == nil {
+		t.Fatal("accepted oversized HTML response")
+	}
+}
+
+func TestFetchVersionFromSourceDecodesGzipFromCustomTransport(t *testing.T) {
+	const title = `<a>Too Good To Go 26.5.0</a>`
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{name: "valid HTML", body: strings.Repeat(title, 300)},
+		{name: "oversized decoded HTML", body: strings.Repeat(" ", 8<<20) + title, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var compressed bytes.Buffer
+			writer := gzip.NewWriter(&compressed)
+			if _, err := io.WriteString(writer, tc.body); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// Tiny gzip streams can store literal HTML and let a scraper pass
+			// without decoding. Ensure this fixture requires decompression.
+			if bytes.Contains(compressed.Bytes(), []byte("26.5.0")) {
+				t.Fatal("compressed fixture contains a literal version")
+			}
+			client := &http.Client{Transport: apkRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Encoding": {"gzip"}},
+					Body:       io.NopCloser(bytes.NewReader(compressed.Bytes())),
+				}, nil
+			})}
+			got, err := fetchVersionFromSource(context.Background(), client, APKVersionSource{
+				Name: "gzip", URL: "https://apk.invalid/", Extract: extractFromAPKMirror,
+			})
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "exceeds") {
+					t.Fatalf("oversized decoded HTML: got %q, %v; want response size error", got, err)
+				}
+			} else if err != nil || got != "26.5.0" {
+				t.Fatalf("valid compressed HTML: got %q, %v; want 26.5.0", got, err)
+			}
+		})
 	}
 }
 
@@ -345,16 +461,11 @@ func TestTGTGVersionRegexRejectsBadShapes(t *testing.T) {
 		"2026.05.06", // ISO date, 4-digit major
 		"abc",        // not a version
 		"26.5",       // missing patch
-		"v26.5.0",    // version isn't isolated by \b correctly with prefix?
+		"v26.5.0",    // version is not an isolated token
 		"123.45.67",  // 3-digit major (too large)
 	}
 	for _, s := range rejected {
 		if reTGTGVersion.MatchString(s) {
-			// Some forms ("26.5" inside "26.5.0a") would still match; we're
-			// testing isolated shapes.
-			if s == "v26.5.0" {
-				continue // \b allows "v" before, regex matches just "26.5.0"
-			}
 			t.Errorf("regex unexpectedly matched %q", s)
 		}
 	}

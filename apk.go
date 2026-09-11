@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -12,7 +11,10 @@ import (
 	"time"
 )
 
-const apkFetchTimeout = 10 * time.Second
+const (
+	apkFetchTimeout     = 10 * time.Second
+	maxAPKResponseBytes = 8 << 20
+)
 
 // scraperUserAgent imitates a desktop browser. Some sources (notably
 // APKMirror) gate non-browser User-Agents.
@@ -21,8 +23,11 @@ const scraperUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KH
 // APKVersionSource is one fallback step for fetching the latest APK version.
 // Exposed so callers can override DefaultAPKVersionSources.
 type APKVersionSource struct {
-	Name    string
-	URL     string
+	// Name identifies the source in discovery errors.
+	Name string
+	// URL is the page to fetch for version discovery.
+	URL string
+	// Extract returns a version from the downloaded HTML or an error.
 	Extract func(body []byte) (string, error)
 }
 
@@ -30,20 +35,25 @@ type APKVersionSource struct {
 // Play Store details page.
 var rePlayStoreDS5 = regexp.MustCompile(`AF_initDataCallback\(\{key:\s*'ds:5'.*?data:([\s\S]*?), sideChannel:.+?</script`)
 
-// reTGTGVersion matches a TooGoodToGo-shaped version string. The major must be
+// reTGTGVersion matches a complete TooGoodToGo-shaped version token. The major must be
 // two digits (TGTG has been at major >= 20 since 2020), which excludes Android
 // minimum-version strings like "5.0.0" and avoids accidentally picking up
 // dates such as "2026.05.06" (whose major has 4 digits).
-var reTGTGVersion = regexp.MustCompile(`\b(\d{2}\.\d{1,2}\.\d{1,2})\b`)
+var reTGTGVersion = regexp.MustCompile(`^(\d{2}\.\d{1,2}\.\d{1,2})$`)
+
+// reAPKVersionToken keeps dotted components and version suffixes together so
+// an unquoted fallback cannot select a substring of a longer token.
+var reAPKVersionToken = regexp.MustCompile(`[[:alnum:]_.+-]+`)
 
 // reTGTGVersionQuoted matches the same shape but inside JSON-style quotes. We
 // prefer this anchor on the Play Store page because the payload is JSON.
 var reTGTGVersionQuoted = regexp.MustCompile(`"(\d{2}\.\d{1,2}\.\d{1,2})"`)
 
 // reTGTGNamedVersion anchors on the app name + a version, used for HTML pages
-// where the version sits near the app title. The gap is bounded so we don't
-// accidentally pick up an unrelated version far down the page.
-var reTGTGNamedVersion = regexp.MustCompile(`(?:Too Good To Go|TooGoodToGo)[\s\S]{0,300}?(\d{2}\.\d{1,2}\.\d{1,2})`)
+// where the version sits in the app title. Do not cross HTML tags or skip
+// digits, and require a complete token so dates and longer versions cannot
+// be truncated into a plausible version.
+var reTGTGNamedVersion = regexp.MustCompile(`(?:Too Good To Go|TooGoodToGo)[^<\d]{0,300}\b(\d{2}\.\d{1,2}\.\d{1,2})(?:$|[^[:alnum:]_.])`)
 
 func extractFromPlayStore(body []byte) (string, error) {
 	m := rePlayStoreDS5.FindSubmatch(body)
@@ -53,7 +63,11 @@ func extractFromPlayStore(body []byte) (string, error) {
 	hits := reTGTGVersionQuoted.FindAllSubmatch(m[1], -1)
 	if len(hits) == 0 {
 		// Fall back to an unquoted match in case Google reformats the payload.
-		hits = reTGTGVersion.FindAllSubmatch(m[1], -1)
+		for _, token := range reAPKVersionToken.FindAll(m[1], -1) {
+			if hit := reTGTGVersion.FindSubmatch(token); hit != nil {
+				hits = append(hits, hit)
+			}
+		}
 	}
 	if len(hits) == 0 {
 		return "", errors.New("no TGTG-shaped version found in ds:5 payload")
@@ -139,6 +153,9 @@ func fetchAPKVersion(ctx context.Context, client *http.Client, sources []APKVers
 	}
 	var errs []error
 	for _, src := range sources {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		v, err := fetchVersionFromSource(ctx, client, src)
 		if err == nil {
 			return v, nil
@@ -165,7 +182,7 @@ func fetchVersionFromSource(ctx context.Context, client *http.Client, src APKVer
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp, maxAPKResponseBytes)
 	if err != nil {
 		return "", fmt.Errorf("read body: %w", err)
 	}

@@ -27,6 +27,7 @@ Originally ported from [`tgtg-python`](https://github.com/ahivert/tgtg-python), 
   - [Orders Lifecycle](#orders-lifecycle)
   - [Sign Up](#sign-up)
 - [Error Handling](#error-handling)
+- [Configuration](#configuration)
 - [DataDome Bot Protection](#datadome-bot-protection)
 - [Development](#development)
 - [License](#license)
@@ -90,7 +91,7 @@ func main() {
 ```
 
 > [!TIP]
-> In automated or headless environments, supply a custom `Config.PinReader` callback (e.g. from an API, SMS, or Slack prompt) instead of reading from standard input. Submitting an empty PIN falls back to the link-click polling flow.
+> In automated or headless environments, supply `Config.PinReaderContext func(context.Context) (string, error)` to receive a PIN from your application and honor cancellation. Returning an empty PIN falls back to the link-click polling flow. The legacy `Config.PinReader` callback remains supported.
 
 ### 2. Using Existing Tokens
 
@@ -100,11 +101,13 @@ Once credentials are saved, initialize the client directly:
 client := tgtg.New(tgtg.Config{
 	AccessToken:  "<your_access_token>",
 	RefreshToken: "<your_refresh_token>",
-	Cookie:       "<your_cookie>",
+	Cookie:       "<saved_credentials_cookie>", // Optional; use Credentials.Cookie.
 })
 ```
 
-The client automatically refreshes the access token when it nears expiration.
+Access and refresh tokens are sufficient to authenticate; a saved cookie is optional. `Credentials.Cookie` contains request cookie pairs such as `session=abc; datadome=xyz`, suitable for restoring through `Config.Cookie`.
+
+The client refreshes tokens on the first login unless `LastTimeTokenRefreshed` is supplied, then refreshes when the elapsed time exceeds `AccessTokenLifetime` (four hours by default). A refresh without a cookie update preserves existing cookies.
 
 ---
 
@@ -216,7 +219,7 @@ err := client.SignupByEmail(ctx, tgtg.DefaultSignupOptions("new_user@example.com
 
 ## Error Handling
 
-Errors returned by `tgtg-go` are strongly typed. Inspect them using `errors.As`:
+Authentication and API response errors are typed. Inspect them using `errors.As`:
 
 ```go
 var (
@@ -237,9 +240,25 @@ case errors.As(err, &pollingErr):
 
 | Type | Description |
 | :--- | :--- |
-| [`*LoginError`](file:///home/miki/go/src/github.com/mikispag/tgtg-go/errors.go#L7) | Authentication failure or invalid credentials. |
-| [`*APIError`](file:///home/miki/go/src/github.com/mikispag/tgtg-go/errors.go#L19) | Non-2xx response or non-`SUCCESS` order state. |
-| [`*PollingError`](file:///home/miki/go/src/github.com/mikispag/tgtg-go/errors.go#L13) | Unregistered email or polling retry timeout. |
+| [`*LoginError`](errors.go) | Authentication failure or invalid authentication response. |
+| [`*APIError`](errors.go) | Unexpected HTTP status, invalid response, or non-`SUCCESS` order state. |
+| [`*PollingError`](errors.go) | Unregistered email or polling retry timeout. |
+
+`LoginError` and `APIError` expose underlying causes through `Unwrap`, so `errors.Is` and `errors.As` can inspect them. An order response rejected at the application level retains its HTTP status, including HTTP 200. Missing required authentication or order fields are errors. Authentication responses update session cookies only after validation succeeds.
+
+---
+
+## Configuration
+
+Use each `*Client` serially. Concurrent callers should use separate clients or synchronize access.
+
+`Config.HTTPClient` supplies transport, redirect, and timeout settings. The client copies it and owns a separate cookie jar, initially seeded with supplied jar cookies applicable to the API base URL. The supplied HTTP client and jar are not modified. A nonzero `Config.Timeout` overrides the supplied timeout; otherwise that timeout is preserved.
+
+`PinReaderContext` and `SleepContext func(context.Context, time.Duration) error` take precedence over the legacy `PinReader` and `Sleep` callbacks. Context callbacks must honor their context. Cancellation stops waiting for legacy callbacks and default stdin input, but their underlying work continues until it finishes. Each client keeps at most one unfinished callback of each kind. Retained PIN input resumes the original login attempt for the same email; changing email waits for and discards the abandoned input before starting a new attempt.
+
+When neither `UserAgent` nor `APKVersion` is supplied, the first request fetches the APK version using its context and the configured HTTP client. Failed lookups fall back to the default version; canceled lookups are not cached.
+
+Decoded response bodies are limited to 16 MiB for API responses, 1 MiB for the DataDome SDK, and 8 MiB for APK version HTML.
 
 ---
 
@@ -247,8 +266,8 @@ case errors.As(err, &pollingErr):
 
 TooGoodToGo uses [DataDome](https://datadome.co/) bot protection.
 
-- The client transparently requests and attaches a valid `datadome` cookie using device fingerprint parameters matching the Android app.
-- If a request receives an HTTP 403, the client clears cookies, re-fetches a fresh DataDome token, and retries the request automatically.
+- The client attempts to obtain and attach a `datadome` cookie using Android device fingerprint parameters. Cookie acquisition is best-effort.
+- If a request receives an HTTP 403, the client removes the rejected DataDome cookie, preserves other session cookies, fetches a fresh DataDome cookie, and retries once.
 - **Tip**: Residential IP addresses have the highest success rate; datacenter/VPN IPs are often blocked by DataDome upstream.
 
 ---

@@ -13,4 +13,4 @@ fmt:
 	gofmt -s -w .
 
 lint: vet
-	gofmt -l . | tee /dev/stderr | (! read)
+	gofmt -s -l . | tee /dev/stderr | (! read)

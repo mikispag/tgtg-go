@@ -24,9 +24,9 @@ expects on the wire, not a constraint on *how* the Go code is written.
   reflexively.
 - **Robust error handling.** Wrap with `%w`, return typed errors that callers
   can `errors.As`, never panic on remote input, always close response bodies.
-- **Concurrency-safe by construction.** No global mutable state; protect any
-  mutable `Client` field touched from multiple goroutines, document goroutine
-  safety expectations on public types.
+- **Explicit ownership and goroutine safety.** A `Client` is used serially;
+  document this on the public type. Own mutable session state and do not mutate
+  caller-supplied HTTP clients or cookie jars.
 - **Testability is a feature.** Inject clocks, sleeps, I/O, randomness, and
   network endpoints rather than reaching for the real ones. Tests must run
   with `-race` and never touch the public internet.
@@ -68,12 +68,18 @@ Single package. Files:
 - **`tgtg.go`** — `Client` struct, `Config`, all endpoint methods, the
   `post()` helper that handles DataDome cookie management + 403 retry, header
   building, UUID/CID generation, default stdin PIN reader.
+- **`auth.go`** — Shared authentication token validation, staged requests, and storage.
+- **`cookie_transaction.go`** — Buffer authentication cookie updates until response validation succeeds.
+- **`context.go`** — Cancellable PIN and polling waits, including legacy callback adapters.
+- **`http.go`** — Bounded response reads and gzip decoding.
 - **`errors.go`** — `LoginError`, `APIError`, `PollingError` typed errors.
   `APIError.State` is set when an order endpoint returns HTTP 200 but the
-  body's `state` field is not `"SUCCESS"`.
+  body's `state` field is not `"SUCCESS"`; `StatusCode` remains 200.
+  `LoginError` and `APIError` retain underlying causes through `Err` and `Unwrap`.
 - **`apk.go`** — Scrapes the Google Play Store page for the current TooGoodToGo
-  APK version. Falls back to `DefaultAPKVersion` on any error. Called lazily
-  from `New()` only when no `UserAgent` is provided.
+  APK version. The first request resolves the version when neither `UserAgent`
+  nor `APKVersion` is provided, using its context and the configured HTTP client.
+  Failed lookups fall back to `DefaultAPKVersion`; cancellation is not cached.
 
 ### Conventions
 
@@ -87,13 +93,21 @@ Single package. Files:
   (`GetItemsOptions`, `GetFavoritesOptions`, `SignupOptions`) with a
   `Default*Options()` helper for sensible defaults. Methods with one or two
   required args take them positionally.
-- Inject `Now func() time.Time`, `Sleep func(time.Duration)`,
-  `PinReader func() (string, error)`, and `Output io.Writer` via `Config` for
-  test seams. The client uses these instead of `time.Now`, `time.Sleep`,
-  stdin, and stdout directly.
-- Goroutine safety: a `*Client` is intended for serial use within a single
-  caller (matches typical HTTP-client usage). If a method ever needs to be
-  goroutine-safe, document and protect the relevant fields explicitly.
+- Inject clocks, PIN readers, sleeps, and output through `Config` for tests.
+  `PinReaderContext func(context.Context) (string, error)` and
+  `SleepContext func(context.Context, time.Duration) error` take precedence
+  over legacy `PinReader` and `Sleep` callbacks and must honor cancellation.
+  Waiting on legacy callbacks and default stdin is cancellable, but the
+  underlying callback may continue. Keep at most one unfinished callback of
+  each kind per client. Bind retained PIN input to the original email and polling
+  ID; changing email discards that result before requesting new authentication.
+- Goroutine safety: a `*Client` is intended for serial use. Concurrent callers
+  must synchronize access or use separate clients.
+- Copy `Config.HTTPClient` and own a fresh cookie jar. Seed it with supplied
+  jar cookies applicable to the API base URL without modifying the supplied
+  client or jar. A nonzero `Config.Timeout` overrides the supplied timeout;
+  otherwise preserve it.
+- Bound decoded responses: API 16 MiB, DataDome SDK 1 MiB, APK HTML 8 MiB.
 
 ### DataDome bot protection
 
@@ -102,8 +116,9 @@ Single package. Files:
    Android app's DataDome SDK (device fingerprint params: model, OS version,
    screen size, etc.). The fetch is best-effort: failures are logged to
    `Config.Output` and never surfaced to the caller.
-2. `post()` calls `ensureDataDomeCookie()` first; on HTTP 403 it clears the
-   jar, refetches, and retries once.
+2. `post()` calls `ensureDataDomeCookie()` first; on HTTP 403 it removes only
+   the rejected `datadome` cookie, refetches, and retries once. Other session
+   cookies survive the retry.
 3. `generateDataDomeCID()` builds random 120-char client IDs in DataDome's
    expected charset.
 4. The DataDome SDK URL is configurable via `Config.DataDomeSDKURL`; tests
@@ -116,13 +131,18 @@ Single package. Files:
 
 1. Email-based login → `auth/v5/authByEmail`.
 2. User receives a PIN via email.
-3. `Config.PinReader` returns the PIN; client submits it via
+3. `Config.PinReaderContext` (or legacy `PinReader`) returns the PIN; client submits it via
    `auth/v5/authByRequestPin`.
-4. If `PinReader` returns an empty string, the client falls back to polling
+4. If the PIN reader returns an empty string, the client falls back to polling
    `auth/v5/authByRequestPollingId` (legacy link-click flow), up to
-   `MaxPollingTries` × `PollingWaitTime`.
-5. On success, `AccessToken`, `RefreshToken`, and `Cookie` are stored on the
-   client.
+   `MaxPollingTries` requests with `PollingWaitTime` between attempts.
+5. Validate both tokens before storing successful authentication responses or
+   committing their cookie updates. Invalid responses preserve existing tokens
+   and session cookies; valid WAIT/202 authentication steps commit their cookies.
+   `Cookie` is a snapshot of the client's jar for the API origin, serialized as
+   request cookie pairs (`a=1; b=2`) for restoration through `Config.Cookie`.
+   Token-only login requires access and refresh tokens; cookies are optional.
+   A refresh without `Set-Cookie` preserves existing cookies.
 6. `LastTimeTokenRefreshed` controls auto-refresh: `Login()` re-uses tokens
    while `Now().Sub(LastTimeTokenRefreshed) <= AccessTokenLifetime`, otherwise
    posts to `token/v1/refresh`. Note: this uses the full duration, not just the
@@ -160,7 +180,9 @@ discover `v1`. Bump in lockstep when TooGoodToGo rolls a new version.
    - Call `c.Login(ctx)` first if authentication is required.
    - Use `c.post(ctx, c.urlFor(endpoint), body)` for the request.
    - On a non-2xx response, return `*APIError`. On a 200 with a non-`SUCCESS`
-     state where applicable, return `*APIError` with `State` set.
+     state where applicable, return `*APIError` with `State` set and
+     `StatusCode` preserved. Reject missing required response fields and
+     preserve decoding causes through `Err`.
    - Use a typed struct for the response if the caller will read named fields;
      fall back to `map[string]any` only when the body is genuinely opaque.
 3. Add tests covering the success path, every failure branch, and any

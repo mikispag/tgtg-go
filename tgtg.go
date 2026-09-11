@@ -4,7 +4,6 @@ package tgtg
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -12,37 +11,57 @@ import (
 	"fmt"
 	"io"
 	mathrand "math/rand/v2"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 )
 
 const (
-	BaseURL                  = "https://apptoogoodtogo.com/api/"
-	APIItemEndpoint          = "item/v9/"
-	FavoriteItemEndpoint     = "user/favorite/v1/%s/update"
-	AuthByEmailEndpoint      = "auth/v5/authByEmail"
-	AuthPollingEndpoint      = "auth/v5/authByRequestPollingId"
+	// BaseURL is the default TooGoodToGo API URL.
+	BaseURL = "https://apptoogoodtogo.com/api/"
+	// APIItemEndpoint lists items or retrieves an item when its ID is appended.
+	APIItemEndpoint = "item/v9/"
+	// FavoriteItemEndpoint updates a favorite; %s is the item ID.
+	FavoriteItemEndpoint = "user/favorite/v1/%s/update"
+	// AuthByEmailEndpoint starts email authentication.
+	AuthByEmailEndpoint = "auth/v5/authByEmail"
+	// AuthPollingEndpoint polls for completed email authentication.
+	AuthPollingEndpoint = "auth/v5/authByRequestPollingId"
+	// AuthByRequestPinEndpoint exchanges an email PIN for credentials.
 	AuthByRequestPinEndpoint = "auth/v5/authByRequestPin"
-	SignupByEmailEndpoint    = "auth/v5/signUpByEmail"
-	RefreshEndpoint          = "token/v1/refresh"
-	ActiveOrderEndpoint      = "order/v8/active"
-	InactiveOrderEndpoint    = "order/v8/inactive"
-	CreateOrderEndpoint      = "order/v8/create/"
-	AbortOrderEndpoint       = "order/v8/%s/abort"
-	OrderStatusEndpoint      = "order/v8/%s/status"
-	APIBucketEndpoint        = "discover/v1/bucket"
+	// SignupByEmailEndpoint registers an account by email.
+	SignupByEmailEndpoint = "auth/v5/signUpByEmail"
+	// RefreshEndpoint exchanges a refresh token for new credentials.
+	RefreshEndpoint = "token/v1/refresh"
+	// ActiveOrderEndpoint lists active orders.
+	ActiveOrderEndpoint = "order/v8/active"
+	// InactiveOrderEndpoint lists inactive orders.
+	InactiveOrderEndpoint = "order/v8/inactive"
+	// CreateOrderEndpoint reserves an item when its ID is appended.
+	CreateOrderEndpoint = "order/v8/create/"
+	// AbortOrderEndpoint cancels an order; %s is the order ID.
+	AbortOrderEndpoint = "order/v8/%s/abort"
+	// OrderStatusEndpoint retrieves order status; %s is the order ID.
+	OrderStatusEndpoint = "order/v8/%s/status"
+	// APIBucketEndpoint retrieves a discovery bucket, including favorites.
+	APIBucketEndpoint = "discover/v1/bucket"
+	// ManufacturerItemEndpoint retrieves manufacturer items.
 	ManufacturerItemEndpoint = "manufactureritem/v2"
-	DataDomeSDKURL           = "https://api-sdk.datadome.co/sdk/"
+	// DataDomeSDKURL is the default endpoint for acquiring DataDome cookies.
+	DataDomeSDKURL = "https://api-sdk.datadome.co/sdk/"
 
-	DefaultAPKVersion          = "26.8.0"
+	// DefaultAPKVersion is used when APK version discovery fails.
+	DefaultAPKVersion = "26.8.0"
+	// DefaultAccessTokenLifetime is the default interval between token refreshes.
 	DefaultAccessTokenLifetime = 4 * time.Hour
-	MaxPollingTries            = 24
-	PollingWaitTime            = 5 * time.Second
+	// MaxPollingTries limits attempts to complete email authentication by polling.
+	MaxPollingTries = 24
+	// PollingWaitTime is the delay between email authentication polling attempts.
+	PollingWaitTime = 5 * time.Second
 )
 
 var userAgentTemplates = []string{
@@ -51,8 +70,6 @@ var userAgentTemplates = []string{
 	"TGTG/%s Dalvik/2.1.0 (Linux; Android 12; SM-G920V Build/MMB29K)",
 }
 
-var reDataDomeCookie = regexp.MustCompile(`datadome=([^;]+)`)
-
 // httpResponse is the value-type result of a successful POST. Returning it by
 // value (rather than *http.Response) makes the contract that "no error => valid
 // fields" enforced by the type system.
@@ -60,83 +77,122 @@ type httpResponse struct {
 	StatusCode int
 	Header     http.Header
 	Body       []byte
-}
-
-// collectSetCookie returns all Set-Cookie headers joined into a single value
-// suitable for round-tripping. The cookiejar handles per-request cookie
-// matching; this string exists so callers can persist credentials and
-// reconstruct a Client later.
-func collectSetCookie(h http.Header) string {
-	values := h.Values("Set-Cookie")
-	if len(values) == 0 {
-		return ""
-	}
-	return strings.Join(values, ", ")
+	cookies    *cookieTransaction
 }
 
 const dataDomeCIDChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789~_"
 
-// Credentials holds the tokens returned by GetCredentials.
+// Credentials holds the tokens and cookies returned by GetCredentials.
 type Credentials struct {
-	AccessToken  string `json:"access_token"`
+	// AccessToken authenticates API requests.
+	AccessToken string `json:"access_token"`
+	// RefreshToken renews the access token.
 	RefreshToken string `json:"refresh_token"`
-	Cookie       string `json:"cookie"`
+	// Cookie contains request cookie pairs for the API origin, without attributes.
+	Cookie string `json:"cookie"`
 }
 
 // Config configures a Client. All fields are optional.
 type Config struct {
-	URL                    string
-	Email                  string
-	AccessToken            string
-	RefreshToken           string
-	Cookie                 string
-	UserAgent              string
-	Language               string
-	DeviceType             string
-	APKVersion             string
-	AccessTokenLifetime    time.Duration
+	// URL is the API base URL. It defaults to BaseURL.
+	URL string
+	// Email is the account address used for email authentication.
+	Email string
+	// AccessToken is a previously issued API access token.
+	AccessToken string
+	// RefreshToken renews AccessToken; supply both tokens to restore a session.
+	RefreshToken string
+	// Cookie contains request cookie pairs to restore into the private cookie jar.
+	Cookie string
+	// UserAgent overrides the generated User-Agent and skips APK version discovery.
+	UserAgent string
+	// Language is the API language preference. It defaults to en-GB.
+	Language string
+	// DeviceType identifies the client platform. It defaults to ANDROID.
+	DeviceType string
+	// APKVersion sets the version used to generate UserAgent, skipping discovery.
+	APKVersion string
+	// AccessTokenLifetime controls when tokens are refreshed. Zero selects the default.
+	AccessTokenLifetime time.Duration
+	// LastTimeTokenRefreshed is the last token refresh time. Zero triggers a refresh.
 	LastTimeTokenRefreshed time.Time
-	Timeout                time.Duration
-	HTTPClient             *http.Client
-	DataDomeSDKURL         string
+	// Timeout sets the HTTP request timeout; zero preserves HTTPClient's timeout.
+	Timeout time.Duration
+	// HTTPClient supplies transport, redirect policy, and timeout settings.
+	// New copies it and seeds a private jar with its cookies for URL.
+	// A nonzero Timeout overrides its timeout. The supplied client is not mutated.
+	HTTPClient *http.Client
+	// DataDomeSDKURL overrides the DataDome cookie endpoint.
+	DataDomeSDKURL string
 	// PinReader returns the PIN entered by the user during email login. If it
 	// returns an empty string, the client falls back to the legacy polling flow.
+	// A callback can finish after cancellation; only one remains in flight.
 	PinReader func() (string, error)
-	// Now and Sleep are exposed for testability. Defaults: time.Now / time.Sleep.
-	Now   func() time.Time
+	// PinReaderContext takes precedence over PinReader and must honor ctx.
+	// An empty PIN selects polling. Prefer it for cancellable input sources.
+	PinReaderContext func(ctx context.Context) (string, error)
+	// Now supplies the current time. It defaults to time.Now.
+	Now func() time.Time
+	// Sleep overrides polling delays. Prefer SleepContext for cancellable waits.
+	// Legacy callbacks can finish after cancellation; only one remains in flight.
 	Sleep func(time.Duration)
+	// SleepContext takes precedence over Sleep and must honor ctx.
+	// With neither set, polling uses a cancellable timer.
+	SleepContext func(ctx context.Context, delay time.Duration) error
 	// Output controls where login progress messages are written. Defaults to os.Stdout.
 	Output io.Writer
 	// APKVersionFetcher fetches the latest TooGoodToGo APK version. It is
 	// invoked lazily on the first request when neither UserAgent nor APKVersion
-	// is supplied, and receives the request's context. Defaults to
-	// GetLastAPKVersion.
+	// is supplied, and receives the request's context. Defaults to version
+	// discovery through the configured HTTP client.
 	APKVersionFetcher func(ctx context.Context) (string, error)
 }
 
-// Client talks to the TooGoodToGo API.
+// Client talks to the TooGoodToGo API. It is intended for serial use; callers
+// must synchronize access to its methods and fields. Separate clients may
+// share an HTTP transport while maintaining independent cookie jars.
 type Client struct {
-	BaseURL                string
-	Email                  string
-	AccessToken            string
-	RefreshToken           string
-	Cookie                 string
-	UserAgent              string
-	Language               string
-	DeviceType             string
-	APKVersion             string
-	AccessTokenLifetime    time.Duration
+	// BaseURL is the API base URL.
+	BaseURL string
+	// Email is the account address used for email authentication.
+	Email string
+	// AccessToken is the current API access token.
+	AccessToken string
+	// RefreshToken renews AccessToken.
+	RefreshToken string
+	// Cookie is a snapshot of request cookie pairs from the private cookie jar.
+	// Use Config.Cookie to restore cookies when creating a client.
+	Cookie string
+	// UserAgent is the User-Agent header sent with API requests.
+	UserAgent string
+	// Language is the API language preference.
+	Language string
+	// DeviceType identifies the client platform.
+	DeviceType string
+	// APKVersion is the configured or discovered app version.
+	APKVersion string
+	// AccessTokenLifetime controls when tokens are refreshed.
+	AccessTokenLifetime time.Duration
+	// LastTimeTokenRefreshed records the last successful token update.
 	LastTimeTokenRefreshed time.Time
-	Timeout                time.Duration
+	// Timeout is the configured HTTP request timeout.
+	Timeout time.Duration
 
-	correlationID     string
-	httpClient        *http.Client
-	dataDomeSDKURL    string
-	pinReader         func() (string, error)
-	now               func() time.Time
-	sleep             func(time.Duration)
-	out               io.Writer
-	apkVersionFetcher func(ctx context.Context) (string, error)
+	correlationID       string
+	httpClient          *http.Client
+	dataDomeSDKURL      string
+	pinReader           func() (string, error)
+	pinReaderContext    func(context.Context) (string, error)
+	promptPIN           bool
+	pendingPIN          <-chan pinResult
+	pendingPINEmail     string
+	pendingPINPollingID string
+	now                 func() time.Time
+	sleep               func(time.Duration)
+	sleepContext        func(context.Context, time.Duration) error
+	pendingSleep        <-chan struct{}
+	out                 io.Writer
+	apkVersionFetcher   func(ctx context.Context) (string, error)
 }
 
 // New creates a Client using cfg, applying defaults for unset fields.
@@ -159,29 +215,50 @@ func New(cfg Config) *Client {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	if cfg.Sleep == nil {
-		cfg.Sleep = time.Sleep
+	if cfg.Sleep == nil && cfg.SleepContext == nil {
+		cfg.SleepContext = sleepWithContext
 	}
 	if cfg.Output == nil {
 		cfg.Output = os.Stdout
 	}
-	if cfg.APKVersionFetcher == nil {
-		cfg.APKVersionFetcher = GetLastAPKVersion
-	}
-	if cfg.PinReader == nil {
-		out := cfg.Output
+	promptPIN := cfg.PinReader == nil && cfg.PinReaderContext == nil
+	if promptPIN {
 		cfg.PinReader = func() (string, error) {
-			return stdinPinReader(out, os.Stdin)
+			return stdinPinReader(io.Discard, os.Stdin)
 		}
 	}
 
-	httpClient := cfg.HTTPClient
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: cfg.Timeout}
+	httpClient := &http.Client{}
+	if cfg.HTTPClient != nil {
+		*httpClient = *cfg.HTTPClient
 	}
-	if httpClient.Jar == nil {
-		jar, _ := cookiejar.New(nil)
-		httpClient.Jar = jar
+	if cfg.Timeout != 0 {
+		httpClient.Timeout = cfg.Timeout
+	}
+	cfg.Timeout = httpClient.Timeout
+	jar, _ := cookiejar.New(nil)
+	if apiURL, err := url.Parse(cfg.URL); err == nil {
+		if httpClient.Jar != nil {
+			for _, cookie := range httpClient.Jar.Cookies(apiURL) {
+				ck := *cookie
+				ck.Path = "/"
+				ck.Secure = apiURL.Scheme == "https"
+				jar.SetCookies(apiURL, []*http.Cookie{&ck})
+			}
+		}
+		req := &http.Request{Header: http.Header{"Cookie": {cfg.Cookie}}}
+		cookies := req.Cookies()
+		for _, ck := range cookies {
+			ck.Path = "/"
+			ck.Secure = apiURL.Scheme == "https"
+		}
+		jar.SetCookies(apiURL, cookies)
+	}
+	httpClient.Jar = jar
+	if cfg.APKVersionFetcher == nil {
+		cfg.APKVersionFetcher = func(ctx context.Context) (string, error) {
+			return fetchAPKVersion(ctx, httpClient, DefaultAPKVersionSources)
+		}
 	}
 
 	c := &Client{
@@ -202,11 +279,15 @@ func New(cfg Config) *Client {
 		httpClient:        httpClient,
 		dataDomeSDKURL:    cfg.DataDomeSDKURL,
 		pinReader:         cfg.PinReader,
+		pinReaderContext:  cfg.PinReaderContext,
+		promptPIN:         promptPIN,
 		now:               cfg.Now,
 		sleep:             cfg.Sleep,
+		sleepContext:      cfg.SleepContext,
 		out:               cfg.Output,
 		apkVersionFetcher: cfg.APKVersionFetcher,
 	}
+	c.syncCookies()
 
 	// When the APK version is already known, build the User-Agent eagerly —
 	// no I/O is required. Otherwise defer resolution to the first request,
@@ -220,13 +301,19 @@ func New(cfg Config) *Client {
 // resolveUserAgent populates c.UserAgent if not already set. When APKVersion
 // is empty, it fetches the latest version using ctx, falling back to
 // DefaultAPKVersion on failure.
-func (c *Client) resolveUserAgent(ctx context.Context) {
+func (c *Client) resolveUserAgent(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.UserAgent != "" {
-		return
+		return nil
 	}
 	if c.APKVersion == "" {
 		v, err := c.apkVersionFetcher(ctx)
-		if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err != nil || v == "" {
 			c.APKVersion = DefaultAPKVersion
 			fmt.Fprintln(c.out, "Failed to get last version")
 		} else {
@@ -236,6 +323,7 @@ func (c *Client) resolveUserAgent(ctx context.Context) {
 	fmt.Fprintf(c.out, "Using version %s\n", c.APKVersion)
 	tmpl := userAgentTemplates[mathrand.IntN(len(userAgentTemplates))]
 	c.UserAgent = fmt.Sprintf(tmpl, c.APKVersion)
+	return nil
 }
 
 func (c *Client) buildHeaders() http.Header {
@@ -246,9 +334,6 @@ func (c *Client) buildHeaders() http.Header {
 	h.Set("Content-Type", "application/json; charset=utf-8")
 	h.Set("User-Agent", c.UserAgent)
 	h.Set("X-Correlation-ID", c.correlationID)
-	if c.Cookie != "" {
-		h.Set("Cookie", c.Cookie)
-	}
 	if c.AccessToken != "" {
 		h.Set("Authorization", "Bearer "+c.AccessToken)
 	}
@@ -266,16 +351,25 @@ func (c *Client) urlFor(path string) string {
 // post sends a POST with JSON body, ensuring a DataDome cookie is attempted
 // and retrying once with a fresh cookie on a 403.
 func (c *Client) post(ctx context.Context, requestURL string, body any) (httpResponse, error) {
-	c.resolveUserAgent(ctx)
+	return c.postWithClient(ctx, requestURL, body, c.httpClient)
+}
+
+func (c *Client) postWithClient(ctx context.Context, requestURL string, body any, client *http.Client) (httpResponse, error) {
+	if err := c.resolveUserAgent(ctx); err != nil {
+		return httpResponse{}, err
+	}
 	c.ensureDataDomeCookie(ctx, requestURL)
-	res, err := c.doPost(ctx, requestURL, body)
+	res, err := c.doPostWithClient(ctx, requestURL, body, client)
 	if err != nil {
 		return httpResponse{}, err
 	}
 	if res.StatusCode == http.StatusForbidden {
-		c.clearCookies()
+		if cookies, ok := client.Jar.(*cookieTransaction); ok {
+			cookies.discard()
+		}
+		c.clearDataDomeCookie(requestURL)
 		c.fetchDataDomeCookie(ctx, requestURL)
-		res, err = c.doPost(ctx, requestURL, body)
+		res, err = c.doPostWithClient(ctx, requestURL, body, client)
 		if err != nil {
 			return httpResponse{}, err
 		}
@@ -284,6 +378,10 @@ func (c *Client) post(ctx context.Context, requestURL string, body any) (httpRes
 }
 
 func (c *Client) doPost(ctx context.Context, requestURL string, body any) (httpResponse, error) {
+	return c.doPostWithClient(ctx, requestURL, body, c.httpClient)
+}
+
+func (c *Client) doPostWithClient(ctx context.Context, requestURL string, body any, client *http.Client) (httpResponse, error) {
 	var reader io.Reader
 	if body != nil {
 		buf, err := json.Marshal(body)
@@ -297,21 +395,13 @@ func (c *Client) doPost(ctx context.Context, requestURL string, body any) (httpR
 		return httpResponse{}, err
 	}
 	req.Header = c.buildHeaders()
-	resp, err := c.httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return httpResponse{}, err
 	}
 	defer resp.Body.Close()
-	var bodyReader io.Reader = resp.Body
-	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-		gz, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return httpResponse{}, fmt.Errorf("gzip reader: %w", err)
-		}
-		defer gz.Close()
-		bodyReader = gz
-	}
-	payload, err := io.ReadAll(bodyReader)
+	c.syncCookies()
+	payload, err := readResponseBody(resp, maxAPIResponseBytes)
 	if err != nil {
 		return httpResponse{}, fmt.Errorf("read response body: %w", err)
 	}
@@ -335,9 +425,53 @@ func (c *Client) ensureDataDomeCookie(ctx context.Context, requestURL string) {
 	c.fetchDataDomeCookie(ctx, requestURL)
 }
 
-func (c *Client) clearCookies() {
-	jar, _ := cookiejar.New(nil)
-	c.httpClient.Jar = jar
+func (c *Client) syncCookies() {
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return
+	}
+	req := &http.Request{Header: make(http.Header)}
+	for _, ck := range c.httpClient.Jar.Cookies(u) {
+		req.AddCookie(ck)
+	}
+	c.Cookie = req.Header.Get("Cookie")
+}
+
+func (c *Client) clearDataDomeCookie(requestURL string) {
+	u, err := url.Parse(requestURL)
+	if err != nil {
+		return
+	}
+	// CookieJar exposes request cookies without their original domain or path.
+	// Expire each scope that could match this request, preserving other cookies.
+	for domain := strings.TrimSuffix(u.Hostname(), "."); domain != ""; {
+		cookieDomain := domain
+		if net.ParseIP(domain) != nil {
+			cookieDomain = ""
+		}
+		path := u.Path
+		if path == "" {
+			path = "/"
+		}
+		for {
+			c.httpClient.Jar.SetCookies(u, []*http.Cookie{{
+				Name: "datadome", Domain: cookieDomain, Path: path, MaxAge: -1,
+			}})
+			if path == "/" {
+				break
+			}
+			if strings.HasSuffix(path, "/") {
+				path = strings.TrimSuffix(path, "/")
+			} else {
+				path = path[:strings.LastIndex(path, "/")+1]
+			}
+		}
+		if net.ParseIP(domain) != nil {
+			break
+		}
+		_, domain, _ = strings.Cut(domain, ".")
+	}
+	c.syncCookies()
 }
 
 func (c *Client) fetchDataDomeCookie(ctx context.Context, requestURL string) {
@@ -374,7 +508,6 @@ func (c *Client) fetchDataDomeCookie(ctx context.Context, requestURL string) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("User-Agent", c.UserAgent)
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		fmt.Fprintln(c.out, "Failed to fetch DataDome cookie")
@@ -384,7 +517,7 @@ func (c *Client) fetchDataDomeCookie(ctx context.Context, requestURL string) {
 	if resp.StatusCode != http.StatusOK {
 		return
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := readResponseBody(resp, maxDataDomeResponseBytes)
 	if err != nil {
 		return
 	}
@@ -398,35 +531,43 @@ func (c *Client) fetchDataDomeCookie(ctx context.Context, requestURL string) {
 	if data.Status != 200 || data.Cookie == "" {
 		return
 	}
-	m := reDataDomeCookie.FindStringSubmatch(data.Cookie)
-	if m == nil {
+	ck, err := http.ParseSetCookie(data.Cookie)
+	if err != nil || ck.Name != "datadome" || ck.Value == "" {
 		return
 	}
 	apiURL, err := url.Parse(c.BaseURL)
 	if err != nil {
 		return
 	}
-	c.httpClient.Jar.SetCookies(apiURL, []*http.Cookie{{
-		Name:   "datadome",
-		Value:  m[1],
-		Domain: apiURL.Hostname(),
-		Path:   "/",
-		Secure: apiURL.Scheme == "https",
-	}})
+	ck.Domain = ""
+	ck.Path = "/"
+	ck.Secure = apiURL.Scheme == "https"
+	c.httpClient.Jar.SetCookies(apiURL, []*http.Cookie{ck})
+	c.syncCookies()
 }
 
-// Login authenticates the client. The first call requires either an email or a
-// full set of access token, refresh token and cookie. If access and refresh
-// tokens are already present, Login refreshes the access token (when expired);
-// otherwise it kicks off the email login flow.
+// Login authenticates the client using an email or both access and refresh
+// tokens. Saved cookies are optional. When both tokens are present, Login
+// refreshes them only when expired. Without both tokens, it starts email login.
 func (c *Client) Login(ctx context.Context) error {
-	if c.Email == "" && !(c.AccessToken != "" && c.RefreshToken != "" && c.Cookie != "") {
-		return errors.New("you must provide at least email or access_token, refresh_token and cookie")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.Email == "" && !c.alreadyLogged() {
+		return &LoginError{Err: errors.New("provide an email or both access_token and refresh_token")}
 	}
 	if c.alreadyLogged() {
 		return c.refreshToken(ctx)
 	}
-	resp, err := c.post(ctx, c.urlFor(AuthByEmailEndpoint), map[string]any{
+	if c.pendingPIN != nil && c.pendingPINPollingID != "" {
+		if c.pendingPINEmail == c.Email {
+			return c.startPolling(ctx, c.pendingPINPollingID)
+		}
+		if err := c.discardPendingPIN(ctx); err != nil {
+			return err
+		}
+	}
+	resp, err := c.postAuth(ctx, c.urlFor(AuthByEmailEndpoint), map[string]any{
 		"device_type": c.DeviceType,
 		"email":       c.Email,
 	})
@@ -439,13 +580,17 @@ func (c *Client) Login(ctx context.Context) error {
 			PollingID string `json:"polling_id"`
 		}
 		if err := json.Unmarshal(resp.Body, &first); err != nil {
-			return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
+			return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode email login response: %w", err)}
 		}
 		switch first.State {
 		case "TERMS":
 			return &PollingError{Message: fmt.Sprintf(
 				"This email %s is not linked to a tgtg account. Please signup with this email first.", c.Email)}
 		case "WAIT":
+			if first.PollingID == "" {
+				return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: errors.New("missing polling_id")}
+			}
+			c.commitAuthCookies(resp)
 			return c.startPolling(ctx, first.PollingID)
 		default:
 			return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
@@ -461,7 +606,7 @@ func (c *Client) refreshToken(ctx context.Context) error {
 	if !c.LastTimeTokenRefreshed.IsZero() && c.now().Sub(c.LastTimeTokenRefreshed) <= c.AccessTokenLifetime {
 		return nil
 	}
-	resp, err := c.post(ctx, c.urlFor(RefreshEndpoint), map[string]any{
+	resp, err := c.postAuth(ctx, c.urlFor(RefreshEndpoint), map[string]any{
 		"refresh_token": c.RefreshToken,
 	})
 	if err != nil {
@@ -470,23 +615,26 @@ func (c *Client) refreshToken(ctx context.Context) error {
 	if resp.StatusCode != http.StatusOK {
 		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
 	}
-	var tok struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-	}
+	var tok authTokens
 	if err := json.Unmarshal(resp.Body, &tok); err != nil {
-		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
+		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode token refresh response: %w", err)}
 	}
-	c.AccessToken = tok.AccessToken
-	c.RefreshToken = tok.RefreshToken
-	c.LastTimeTokenRefreshed = c.now()
-	c.Cookie = collectSetCookie(resp.Header)
+	if err := tok.validate(); err != nil {
+		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: err}
+	}
+	c.storeTokens(tok, resp)
 	return nil
 }
 
 func (c *Client) startPolling(ctx context.Context, pollingID string) error {
 	fmt.Fprintln(c.out, "Check your email for a login PIN code.")
-	pin, err := c.pinReader()
+	c.pendingPINEmail = c.Email
+	c.pendingPINPollingID = pollingID
+	pin, err := c.readPIN(ctx)
+	if c.pendingPIN == nil {
+		c.pendingPINEmail = ""
+		c.pendingPINPollingID = ""
+	}
 	if err != nil {
 		return err
 	}
@@ -495,7 +643,7 @@ func (c *Client) startPolling(ctx context.Context, pollingID string) error {
 		return c.authByPIN(ctx, pollingID, pin)
 	}
 	for i := 0; i < MaxPollingTries; i++ {
-		resp, err := c.post(ctx, c.urlFor(AuthPollingEndpoint), map[string]any{
+		resp, err := c.postAuth(ctx, c.urlFor(AuthPollingEndpoint), map[string]any{
 			"device_type":        c.DeviceType,
 			"email":              c.Email,
 			"request_polling_id": pollingID,
@@ -505,23 +653,25 @@ func (c *Client) startPolling(ctx context.Context, pollingID string) error {
 		}
 		switch resp.StatusCode {
 		case http.StatusAccepted:
+			c.commitAuthCookies(resp)
 			fmt.Fprintln(c.out, "Check your mailbox on PC to continue... "+
 				"(Opening email on mobile won't work, if you have installed tgtg app.)")
-			c.sleep(PollingWaitTime)
+			if i+1 < MaxPollingTries {
+				if err := c.wait(ctx, PollingWaitTime); err != nil {
+					return err
+				}
+			}
 			continue
 		case http.StatusOK:
-			fmt.Fprintln(c.out, "Logged in!")
-			var tok struct {
-				AccessToken  string `json:"access_token"`
-				RefreshToken string `json:"refresh_token"`
-			}
+			var tok authTokens
 			if err := json.Unmarshal(resp.Body, &tok); err != nil {
-				return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
+				return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode polling response: %w", err)}
 			}
-			c.AccessToken = tok.AccessToken
-			c.RefreshToken = tok.RefreshToken
-			c.LastTimeTokenRefreshed = c.now()
-			c.Cookie = collectSetCookie(resp.Header)
+			if err := tok.validate(); err != nil {
+				return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: err}
+			}
+			c.storeTokens(tok, resp)
+			fmt.Fprintln(c.out, "Logged in!")
 			return nil
 		case http.StatusTooManyRequests:
 			return &APIError{StatusCode: resp.StatusCode, Body: "Too many requests. Try again later."}
@@ -530,11 +680,11 @@ func (c *Client) startPolling(ctx context.Context, pollingID string) error {
 		}
 	}
 	return &PollingError{Message: fmt.Sprintf(
-		"Max retries (%d seconds) reached. Try again.", int(MaxPollingTries*PollingWaitTime/time.Second))}
+		"Max retries (%d attempts) reached. Try again.", MaxPollingTries)}
 }
 
 func (c *Client) authByPIN(ctx context.Context, pollingID, pin string) error {
-	resp, err := c.post(ctx, c.urlFor(AuthByRequestPinEndpoint), map[string]any{
+	resp, err := c.postAuth(ctx, c.urlFor(AuthByRequestPinEndpoint), map[string]any{
 		"device_type":        c.DeviceType,
 		"email":              c.Email,
 		"request_pin":        pin,
@@ -546,18 +696,15 @@ func (c *Client) authByPIN(ctx context.Context, pollingID, pin string) error {
 	if resp.StatusCode != http.StatusOK {
 		return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
 	}
-	fmt.Fprintln(c.out, "Logged in!")
-	var tok struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-	}
+	var tok authTokens
 	if err := json.Unmarshal(resp.Body, &tok); err != nil {
-		return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
+		return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode PIN response: %w", err)}
 	}
-	c.AccessToken = tok.AccessToken
-	c.RefreshToken = tok.RefreshToken
-	c.LastTimeTokenRefreshed = c.now()
-	c.Cookie = collectSetCookie(resp.Header)
+	if err := tok.validate(); err != nil {
+		return &LoginError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: err}
+	}
+	c.storeTokens(tok, resp)
+	fmt.Fprintln(c.out, "Logged in!")
 	return nil
 }
 
@@ -566,6 +713,7 @@ func (c *Client) GetCredentials(ctx context.Context) (Credentials, error) {
 	if err := c.Login(ctx); err != nil {
 		return Credentials{}, err
 	}
+	c.syncCookies()
 	return Credentials{
 		AccessToken:  c.AccessToken,
 		RefreshToken: c.RefreshToken,
@@ -573,23 +721,38 @@ func (c *Client) GetCredentials(ctx context.Context) (Credentials, error) {
 	}, nil
 }
 
-// GetItemsOptions mirrors the keyword arguments of Python's get_items.
+// GetItemsOptions configures the location, paging, and filters for GetItems.
 type GetItemsOptions struct {
-	Latitude       float64
-	Longitude      float64
-	Radius         int
-	PageSize       int
-	Page           int
-	Discover       bool
-	FavoritesOnly  bool
+	// Latitude is the search origin's latitude in degrees.
+	Latitude float64
+	// Longitude is the search origin's longitude in degrees.
+	Longitude float64
+	// Radius is the search radius sent to the API.
+	Radius int
+	// PageSize is the requested number of items per page.
+	PageSize int
+	// Page is the requested page number.
+	Page int
+	// Discover enables the API's discover filter.
+	Discover bool
+	// FavoritesOnly restricts results to favorites.
+	FavoritesOnly bool
+	// ItemCategories restricts results to the supplied item category identifiers.
 	ItemCategories []string
+	// DietCategories restricts results to the supplied dietary category identifiers.
 	DietCategories []string
+	// PickupEarliest sets the earliest pickup time; nil leaves it unrestricted.
 	PickupEarliest *time.Time
-	PickupLatest   *time.Time
-	SearchPhrase   string
-	WithStockOnly  bool
-	HiddenOnly     bool
-	WeCareOnly     bool
+	// PickupLatest sets the latest pickup time; nil leaves it unrestricted.
+	PickupLatest *time.Time
+	// SearchPhrase filters results by text; an empty string leaves it unrestricted.
+	SearchPhrase string
+	// WithStockOnly restricts results to items with available stock.
+	WithStockOnly bool
+	// HiddenOnly enables the API's hidden_only filter.
+	HiddenOnly bool
+	// WeCareOnly enables the API's we_care_only filter.
+	WeCareOnly bool
 }
 
 // DefaultGetItemsOptions returns options matching the Python defaults
@@ -603,7 +766,8 @@ func DefaultGetItemsOptions() GetItemsOptions {
 	}
 }
 
-// GetItems lists items, defaulting to the caller's favorites.
+// GetItems lists items using opts. Use DefaultGetItemsOptions for defaults,
+// including restricting results to favorites; zero options do not apply defaults.
 func (c *Client) GetItems(ctx context.Context, opts GetItemsOptions) ([]map[string]any, error) {
 	if err := c.Login(ctx); err != nil {
 		return nil, err
@@ -654,7 +818,7 @@ func (c *Client) GetItems(ctx context.Context, opts GetItemsOptions) ([]map[stri
 		Items []map[string]any `json:"items"`
 	}
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return nil, fmt.Errorf("decode get_items response: %w", err)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode get_items response: %w", err)}
 	}
 	if out.Items == nil {
 		out.Items = []map[string]any{}
@@ -676,7 +840,7 @@ func (c *Client) GetItem(ctx context.Context, itemID string) (map[string]any, er
 	}
 	var out map[string]any
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return nil, fmt.Errorf("decode get_item response: %w", err)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode get_item response: %w", err)}
 	}
 	if out == nil {
 		out = map[string]any{}
@@ -686,11 +850,16 @@ func (c *Client) GetItem(ctx context.Context, itemID string) (map[string]any, er
 
 // GetFavoritesOptions configures GetFavorites.
 type GetFavoritesOptions struct {
-	Latitude  float64
+	// Latitude is the search origin's latitude in degrees.
+	Latitude float64
+	// Longitude is the search origin's longitude in degrees.
 	Longitude float64
-	Radius    int
-	PageSize  int
-	Page      int
+	// Radius is the search radius sent to the API.
+	Radius int
+	// PageSize is the requested number of favorites per page.
+	PageSize int
+	// Page is the requested page number.
+	Page int
 }
 
 // DefaultGetFavoritesOptions returns radius=21, page_size=50, page=0.
@@ -722,7 +891,7 @@ func (c *Client) GetFavorites(ctx context.Context, opts GetFavoritesOptions) ([]
 		} `json:"mobile_bucket"`
 	}
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return nil, fmt.Errorf("decode get_favorites response: %w", err)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode get_favorites response: %w", err)}
 	}
 	items := out.MobileBucket.Items
 	if items == nil {
@@ -767,13 +936,13 @@ func (c *Client) CreateOrder(ctx context.Context, itemID string, itemCount int) 
 		Order map[string]any `json:"order"`
 	}
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return nil, fmt.Errorf("decode create_order response: %w", err)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode create_order response: %w", err)}
 	}
 	if out.State != "SUCCESS" {
-		return nil, &APIError{State: out.State, Body: string(resp.Body)}
+		return nil, &APIError{StatusCode: resp.StatusCode, State: out.State, Body: string(resp.Body)}
 	}
 	if out.Order == nil {
-		out.Order = map[string]any{}
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: errors.New("create_order response is missing an order object")}
 	}
 	return out.Order, nil
 }
@@ -792,7 +961,7 @@ func (c *Client) GetOrderStatus(ctx context.Context, orderID string) (map[string
 	}
 	var out map[string]any
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return nil, fmt.Errorf("decode get_order_status response: %w", err)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode get_order_status response: %w", err)}
 	}
 	if out == nil {
 		out = map[string]any{}
@@ -818,20 +987,25 @@ func (c *Client) AbortOrder(ctx context.Context, orderID string) error {
 		State string `json:"state"`
 	}
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
+		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode abort_order response: %w", err)}
 	}
 	if out.State != "SUCCESS" {
-		return &APIError{State: out.State, Body: string(resp.Body)}
+		return &APIError{StatusCode: resp.StatusCode, State: out.State, Body: string(resp.Body)}
 	}
 	return nil
 }
 
-// SignupOptions mirrors signup_by_email keyword arguments.
+// SignupOptions configures account registration with SignupByEmail.
 type SignupOptions struct {
-	Email                 string
-	Name                  string
-	CountryID             string
-	NewsletterOptIn       bool
+	// Email is the address for the new account.
+	Email string
+	// Name is the account holder's name.
+	Name string
+	// CountryID is the account country code. An empty value defaults to GB.
+	CountryID string
+	// NewsletterOptIn subscribes the account to newsletters.
+	NewsletterOptIn bool
+	// PushNotificationOptIn enables push notifications for the account.
 	PushNotificationOptIn bool
 }
 
@@ -845,7 +1019,7 @@ func (c *Client) SignupByEmail(ctx context.Context, opts SignupOptions) error {
 	if opts.CountryID == "" {
 		opts.CountryID = "GB"
 	}
-	resp, err := c.post(ctx, c.urlFor(SignupByEmailEndpoint), map[string]any{
+	resp, err := c.postAuth(ctx, c.urlFor(SignupByEmailEndpoint), map[string]any{
 		"country_id":               opts.CountryID,
 		"device_type":              c.DeviceType,
 		"email":                    opts.Email,
@@ -860,18 +1034,15 @@ func (c *Client) SignupByEmail(ctx context.Context, opts SignupOptions) error {
 		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
 	}
 	var out struct {
-		LoginResponse struct {
-			AccessToken  string `json:"access_token"`
-			RefreshToken string `json:"refresh_token"`
-		} `json:"login_response"`
+		LoginResponse authTokens `json:"login_response"`
 	}
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
+		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode signup response: %w", err)}
 	}
-	c.AccessToken = out.LoginResponse.AccessToken
-	c.RefreshToken = out.LoginResponse.RefreshToken
-	c.LastTimeTokenRefreshed = c.now()
-	c.Cookie = collectSetCookie(resp.Header)
+	if err := out.LoginResponse.validate(); err != nil {
+		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("validate signup response: %w", err)}
+	}
+	c.storeTokens(out.LoginResponse, resp)
 	return nil
 }
 
@@ -889,7 +1060,7 @@ func (c *Client) GetActive(ctx context.Context) (map[string]any, error) {
 	}
 	var out map[string]any
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return nil, fmt.Errorf("decode get_active response: %w", err)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode get_active response: %w", err)}
 	}
 	if out == nil {
 		out = map[string]any{}
@@ -899,7 +1070,9 @@ func (c *Client) GetActive(ctx context.Context) (map[string]any, error) {
 
 // GetInactiveOptions configures GetInactive.
 type GetInactiveOptions struct {
-	Page     int
+	// Page is the requested page number.
+	Page int
+	// PageSize is the requested number of inactive orders per page.
 	PageSize int
 }
 
@@ -924,7 +1097,7 @@ func (c *Client) GetInactive(ctx context.Context, opts GetInactiveOptions) (map[
 	}
 	var out map[string]any
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return nil, fmt.Errorf("decode get_inactive response: %w", err)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode get_inactive response: %w", err)}
 	}
 	if out == nil {
 		out = map[string]any{}
@@ -953,7 +1126,7 @@ func (c *Client) GetManufacturerItems(ctx context.Context) (map[string]any, erro
 	}
 	var out map[string]any
 	if err := json.Unmarshal(resp.Body, &out); err != nil {
-		return nil, fmt.Errorf("decode get_manufacturer_items response: %w", err)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body), Err: fmt.Errorf("decode get_manufacturer_items response: %w", err)}
 	}
 	if out == nil {
 		out = map[string]any{}
