@@ -107,6 +107,8 @@ client := tgtg.New(tgtg.Config{
 
 Access and refresh tokens are sufficient to authenticate; a saved cookie is optional. `Credentials.Cookie` contains request cookie pairs such as `session=abc; datadome=xyz`, suitable for restoring through `Config.Cookie`.
 
+When restoring cookie pairs, the first value for a repeated name takes precedence. `Config.Cookie` overrides cookies seeded from a supplied HTTP client's jar. Authentication redirects receive provisional cookie updates; those updates become part of the saved session only after the response is validated, preserving their original expiry.
+
 The client refreshes tokens on the first login unless `LastTimeTokenRefreshed` is supplied, then refreshes when the elapsed time exceeds `AccessTokenLifetime` (four hours by default). A refresh without a cookie update preserves existing cookies.
 
 ---
@@ -252,9 +254,11 @@ case errors.As(err, &pollingErr):
 
 Use each `*Client` serially. Concurrent callers should use separate clients or synchronize access.
 
+`Config.URL` accepts an API base URL with or without a trailing slash. Item and order IDs are escaped as individual URL path segments.
+
 `Config.HTTPClient` supplies transport, redirect, and timeout settings. The client copies it and owns a separate cookie jar, initially seeded with supplied jar cookies applicable to the API base URL. The supplied HTTP client and jar are not modified. A nonzero `Config.Timeout` overrides the supplied timeout; otherwise that timeout is preserved.
 
-`PinReaderContext` and `SleepContext func(context.Context, time.Duration) error` take precedence over the legacy `PinReader` and `Sleep` callbacks. Context callbacks must honor their context. Cancellation stops waiting for legacy callbacks and default stdin input, but their underlying work continues until it finishes. Each client keeps at most one unfinished callback of each kind. Retained PIN input resumes the original login attempt for the same email; changing email waits for and discards the abandoned input before starting a new attempt.
+`PinReaderContext` and `SleepContext func(context.Context, time.Duration) error` take precedence over the legacy `PinReader` and `Sleep` callbacks. Context callbacks must honor their context. Cancellation stops waiting for legacy callbacks and default stdin input, but their underlying work continues until it finishes. Each client keeps at most one unfinished callback of each kind. Retained PIN input resumes the original login attempt for the same email; changing email waits for and discards the abandoned input before starting a new attempt. A canceled legacy sleep must finish before the next delay starts; its completion does not satisfy the new delay.
 
 When neither `UserAgent` nor `APKVersion` is supplied, the first request fetches the APK version using its context and the configured HTTP client. Failed lookups fall back to the default version; canceled lookups are not cached.
 

@@ -6,45 +6,46 @@ import (
 	"sync"
 )
 
-type cookieUpdate struct {
-	url     url.URL
-	cookies []*http.Cookie
-}
-
-// cookieTransaction sends only established cookies and buffers response
-// updates, including redirects. Failed authentication discards the updates.
+// cookieTransaction exposes provisional cookies to redirects while keeping
+// the established session unchanged until authentication is validated.
 type cookieTransaction struct {
-	base    http.CookieJar
+	base    *ownedCookieJar
 	mu      sync.Mutex
-	updates []cookieUpdate
+	pending *ownedCookieJar
 }
 
 func (j *cookieTransaction) Cookies(u *url.URL) []*http.Cookie {
-	return j.base.Cookies(u)
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.snapshot().Cookies(u)
 }
 
 func (j *cookieTransaction) SetCookies(u *url.URL, cookies []*http.Cookie) {
-	update := cookieUpdate{url: *u, cookies: make([]*http.Cookie, len(cookies))}
-	for i, cookie := range cookies {
-		copy := *cookie
-		update.cookies[i] = &copy
-	}
 	j.mu.Lock()
-	j.updates = append(j.updates, update)
-	j.mu.Unlock()
+	defer j.mu.Unlock()
+	j.snapshot().SetCookies(u, cookies)
+}
+
+// The first snapshot is taken after live DataDome acquisition. A 403 discards
+// it before refreshing DataDome, so the next attempt sees the refreshed jar.
+func (j *cookieTransaction) snapshot() *ownedCookieJar {
+	if j.pending == nil {
+		j.pending = j.base.clone()
+	}
+	return j.pending
 }
 
 func (j *cookieTransaction) discard() {
 	j.mu.Lock()
-	j.updates = nil
+	j.pending = nil
 	j.mu.Unlock()
 }
 
 func (j *cookieTransaction) commit() {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	for _, update := range j.updates {
-		j.base.SetCookies(&update.url, update.cookies)
+	if j.pending != nil {
+		j.base.replace(j.pending)
+		j.pending = nil
 	}
-	j.updates = nil
 }

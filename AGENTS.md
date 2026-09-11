@@ -69,7 +69,10 @@ Single package. Files:
   `post()` helper that handles DataDome cookie management + 403 retry, header
   building, UUID/CID generation, default stdin PIN reader.
 - **`auth.go`** — Shared authentication token validation, staged requests, and storage.
-- **`cookie_transaction.go`** — Buffer authentication cookie updates until response validation succeeds.
+- **`cookie_transaction.go`** — Make provisional cookies available to authentication
+  redirects and commit the snapshot only after response validation succeeds.
+- **`owned_cookie_jar.go`** — Retain current cookie metadata for snapshots, preserve
+  receipt-time expiry, and delegate cookie acceptance and matching to the standard library.
 - **`context.go`** — Cancellable PIN and polling waits, including legacy callback adapters.
 - **`http.go`** — Bounded response reads and gzip decoding.
 - **`errors.go`** — `LoginError`, `APIError`, `PollingError` typed errors.
@@ -87,6 +90,8 @@ Single package. Files:
   cancellation.
 - Endpoint constants (`AuthByEmailEndpoint`, etc.) are exported and use Go
   format-string syntax (`%s`) for path parameters.
+- API base URLs accept an optional trailing slash. Escape item/order IDs as
+  individual path segments, including literal dot segments.
 - Constructor `New(Config)` applies defaults for unset fields. Extend `Config`
   rather than adding parallel constructors.
 - Methods with many optional parameters take an options struct
@@ -101,12 +106,17 @@ Single package. Files:
   underlying callback may continue. Keep at most one unfinished callback of
   each kind per client. Bind retained PIN input to the original email and polling
   ID; changing email discards that result before requesting new authentication.
+  A canceled legacy sleep must finish before a new delay starts; discard the
+  abandoned result rather than using it to satisfy the new delay.
 - Goroutine safety: a `*Client` is intended for serial use. Concurrent callers
   must synchronize access or use separate clients.
 - Copy `Config.HTTPClient` and own a fresh cookie jar. Seed it with supplied
   jar cookies applicable to the API base URL without modifying the supplied
   client or jar. A nonzero `Config.Timeout` overrides the supplied timeout;
   otherwise preserve it.
+  Flattened cookie snapshots keep the first value for each name. `Config.Cookie`
+  takes precedence over the supplied jar. Authentication snapshots preserve
+  cookie scope, creation order, and expiry measured from receipt, including redirects.
 - Bound decoded responses: API 16 MiB, DataDome SDK 1 MiB, APK HTML 8 MiB.
 
 ### DataDome bot protection

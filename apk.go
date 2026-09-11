@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -49,11 +50,14 @@ var reAPKVersionToken = regexp.MustCompile(`[[:alnum:]_.+-]+`)
 // prefer this anchor on the Play Store page because the payload is JSON.
 var reTGTGVersionQuoted = regexp.MustCompile(`"(\d{2}\.\d{1,2}\.\d{1,2})"`)
 
+// reAPKMirrorText extracts text between tags before HTML entities are decoded.
+var reAPKMirrorText = regexp.MustCompile(`>([^<]+)<`)
+
 // reTGTGNamedVersion anchors on the app name + a version, used for HTML pages
 // where the version sits in the app title. Do not cross HTML tags or skip
 // digits, and require a complete token so dates and longer versions cannot
 // be truncated into a plausible version.
-var reTGTGNamedVersion = regexp.MustCompile(`(?:Too Good To Go|TooGoodToGo)[^<\d]{0,300}\b(\d{2}\.\d{1,2}\.\d{1,2})(?:$|[^[:alnum:]_.])`)
+var reTGTGNamedVersion = regexp.MustCompile(`(?:Too Good To Go|TooGoodToGo)[^<\d]{0,300}\b(\d{2}\.\d{1,2}\.\d{1,2})(?:$|[^[:alnum:]_.+-])`)
 
 func extractFromPlayStore(body []byte) (string, error) {
 	m := rePlayStoreDS5.FindSubmatch(body)
@@ -78,7 +82,11 @@ func extractFromPlayStore(body []byte) (string, error) {
 }
 
 func extractFromAPKMirror(body []byte) (string, error) {
-	hits := reTGTGNamedVersion.FindAllSubmatch(body, -1)
+	var hits [][][]byte
+	for _, text := range reAPKMirrorText.FindAllSubmatch(body, -1) {
+		title := []byte(html.UnescapeString(string(text[1])))
+		hits = append(hits, reTGTGNamedVersion.FindAllSubmatch(title, -1)...)
+	}
 	if len(hits) == 0 {
 		return "", errors.New("APKMirror: no TGTG-shaped version found")
 	}

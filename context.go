@@ -12,7 +12,7 @@ type pinResult struct {
 }
 
 // awaitCallback retains at most one unfinished legacy callback. Cancellation
-// returns promptly without spawning another reader or sleeper on the next call.
+// returns promptly while leaving its result available to a later call.
 func awaitCallback[T any](ctx context.Context, pending *<-chan T, call func() T) (T, error) {
 	var zero T
 	if err := ctx.Err(); err != nil {
@@ -81,6 +81,16 @@ func (c *Client) wait(ctx context.Context, delay time.Duration) error {
 			return ctx.Err()
 		}
 		return err
+	}
+	// A retained callback belongs to a canceled wait. Let it finish before
+	// starting this delay, so an earlier sleep cannot shorten a new one.
+	if c.pendingSleep != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.pendingSleep:
+			c.pendingSleep = nil
+		}
 	}
 	sleep := c.sleep
 	_, err := awaitCallback(ctx, &c.pendingSleep, func() struct{} {

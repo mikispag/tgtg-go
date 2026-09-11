@@ -13,7 +13,6 @@ import (
 	mathrand "math/rand/v2"
 	"net"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"strings"
@@ -94,7 +93,7 @@ type Credentials struct {
 
 // Config configures a Client. All fields are optional.
 type Config struct {
-	// URL is the API base URL. It defaults to BaseURL.
+	// URL is the API base URL, with an optional trailing slash. It defaults to BaseURL.
 	URL string
 	// Email is the account address used for email authentication.
 	Email string
@@ -131,7 +130,7 @@ type Config struct {
 	// PinReaderContext takes precedence over PinReader and must honor ctx.
 	// An empty PIN selects polling. Prefer it for cancellable input sources.
 	PinReaderContext func(ctx context.Context) (string, error)
-	// Now supplies the current time. It defaults to time.Now.
+	// Now supplies the time for token and cookie expiry. It defaults to time.Now.
 	Now func() time.Time
 	// Sleep overrides polling delays. Prefer SleepContext for cancellable waits.
 	// Legacy callbacks can finish after cancellation; only one remains in flight.
@@ -200,6 +199,7 @@ func New(cfg Config) *Client {
 	if cfg.URL == "" {
 		cfg.URL = BaseURL
 	}
+	cfg.URL = strings.TrimRight(cfg.URL, "/") + "/"
 	if cfg.Language == "" {
 		cfg.Language = "en-GB"
 	}
@@ -223,8 +223,9 @@ func New(cfg Config) *Client {
 	}
 	promptPIN := cfg.PinReader == nil && cfg.PinReaderContext == nil
 	if promptPIN {
+		in := bufio.NewReader(os.Stdin)
 		cfg.PinReader = func() (string, error) {
-			return stdinPinReader(io.Discard, os.Stdin)
+			return stdinPinReader(io.Discard, in)
 		}
 	}
 
@@ -236,23 +237,13 @@ func New(cfg Config) *Client {
 		httpClient.Timeout = cfg.Timeout
 	}
 	cfg.Timeout = httpClient.Timeout
-	jar, _ := cookiejar.New(nil)
+	jar := newOwnedCookieJar(cfg.Now)
 	if apiURL, err := url.Parse(cfg.URL); err == nil {
 		if httpClient.Jar != nil {
-			for _, cookie := range httpClient.Jar.Cookies(apiURL) {
-				ck := *cookie
-				ck.Path = "/"
-				ck.Secure = apiURL.Scheme == "https"
-				jar.SetCookies(apiURL, []*http.Cookie{&ck})
-			}
+			seedCookieSnapshot(jar, apiURL, httpClient.Jar.Cookies(apiURL))
 		}
 		req := &http.Request{Header: http.Header{"Cookie": {cfg.Cookie}}}
-		cookies := req.Cookies()
-		for _, ck := range cookies {
-			ck.Path = "/"
-			ck.Secure = apiURL.Scheme == "https"
-		}
-		jar.SetCookies(apiURL, cookies)
+		seedCookieSnapshot(jar, apiURL, req.Cookies())
 	}
 	httpClient.Jar = jar
 	if cfg.APKVersionFetcher == nil {
@@ -345,7 +336,15 @@ func (c *Client) alreadyLogged() bool {
 }
 
 func (c *Client) urlFor(path string) string {
-	return c.BaseURL + path
+	return strings.TrimRight(c.BaseURL, "/") + "/" + path
+}
+
+// escapeID keeps an identifier in one path segment, including dot segments.
+func escapeID(id string) string {
+	if id == "." || id == ".." {
+		return strings.ReplaceAll(id, ".", "%2E")
+	}
+	return url.PathEscape(id)
 }
 
 // post sends a POST with JSON body, ensuring a DataDome cookie is attempted
@@ -426,7 +425,7 @@ func (c *Client) ensureDataDomeCookie(ctx context.Context, requestURL string) {
 }
 
 func (c *Client) syncCookies() {
-	u, err := url.Parse(c.BaseURL)
+	u, err := url.Parse(c.urlFor(""))
 	if err != nil {
 		return
 	}
@@ -831,7 +830,7 @@ func (c *Client) GetItem(ctx context.Context, itemID string) (map[string]any, er
 	if err := c.Login(ctx); err != nil {
 		return nil, err
 	}
-	resp, err := c.post(ctx, c.urlFor(APIItemEndpoint)+itemID, map[string]any{"origin": nil})
+	resp, err := c.post(ctx, c.urlFor(APIItemEndpoint)+escapeID(itemID), map[string]any{"origin": nil})
 	if err != nil {
 		return nil, err
 	}
@@ -905,7 +904,7 @@ func (c *Client) SetFavorite(ctx context.Context, itemID string, isFavorite bool
 	if err := c.Login(ctx); err != nil {
 		return err
 	}
-	resp, err := c.post(ctx, c.urlFor(fmt.Sprintf(FavoriteItemEndpoint, itemID)), map[string]any{
+	resp, err := c.post(ctx, c.urlFor(fmt.Sprintf(FavoriteItemEndpoint, escapeID(itemID))), map[string]any{
 		"is_favorite": isFavorite,
 	})
 	if err != nil {
@@ -922,7 +921,7 @@ func (c *Client) CreateOrder(ctx context.Context, itemID string, itemCount int) 
 	if err := c.Login(ctx); err != nil {
 		return nil, err
 	}
-	resp, err := c.post(ctx, c.urlFor(CreateOrderEndpoint)+itemID, map[string]any{
+	resp, err := c.post(ctx, c.urlFor(CreateOrderEndpoint)+escapeID(itemID), map[string]any{
 		"item_count": itemCount,
 	})
 	if err != nil {
@@ -952,7 +951,7 @@ func (c *Client) GetOrderStatus(ctx context.Context, orderID string) (map[string
 	if err := c.Login(ctx); err != nil {
 		return nil, err
 	}
-	resp, err := c.post(ctx, c.urlFor(fmt.Sprintf(OrderStatusEndpoint, orderID)), nil)
+	resp, err := c.post(ctx, c.urlFor(fmt.Sprintf(OrderStatusEndpoint, escapeID(orderID))), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -974,7 +973,7 @@ func (c *Client) AbortOrder(ctx context.Context, orderID string) error {
 	if err := c.Login(ctx); err != nil {
 		return err
 	}
-	resp, err := c.post(ctx, c.urlFor(fmt.Sprintf(AbortOrderEndpoint, orderID)), map[string]any{
+	resp, err := c.post(ctx, c.urlFor(fmt.Sprintf(AbortOrderEndpoint, escapeID(orderID))), map[string]any{
 		"cancel_reason_id": 1,
 	})
 	if err != nil {

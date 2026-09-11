@@ -172,6 +172,24 @@ func TestExtractFromAPKMirrorAlternateName(t *testing.T) {
 	}
 }
 
+func TestExtractFromAPKMirrorDecodesTitleEntities(t *testing.T) {
+	for _, title := range []string{
+		`Too Good To Go&#58; End Food Waste 26.5.0`,
+		`Too Good To Go: End Food Waste&#32;26.5.0`,
+		`Too Good To Go: End Food Waste&#x20;26.5.0`,
+		`Too&#32;Good To Go: End Food Waste 26.5.0`,
+		`Too Good To Go&colon; End Food Waste 26.5.0`,
+		`Too Good To Go: End Food Waste 26&period;5&period;0`,
+	} {
+		t.Run(title, func(t *testing.T) {
+			got, err := extractFromAPKMirror([]byte("<a>" + title + "</a>"))
+			if err != nil || got != "26.5.0" {
+				t.Fatalf("extract = %q, %v; want 26.5.0", got, err)
+			}
+		})
+	}
+}
+
 func TestExtractFromAPKMirrorNoMatch(t *testing.T) {
 	_, err := extractFromAPKMirror([]byte(`<html>completely unrelated</html>`))
 	if err == nil {
@@ -180,7 +198,7 @@ func TestExtractFromAPKMirrorNoMatch(t *testing.T) {
 }
 
 func TestExtractFromAPKMirrorRejectsMalformedVersions(t *testing.T) {
-	for _, version := range []string{"2026.12.31", "26.5.100", "126.5.0", "26.5.0.1", "v26.5.0", "26.5.0abc"} {
+	for _, version := range []string{"2026.12.31", "26.5.100", "126.5.0", "26.5.0.1", "v26.5.0", "26.5.0abc", "26.5.0-beta", "26.5.0+build", "26.5.0&#45;beta", "26.5.0&plus;build"} {
 		t.Run(version, func(t *testing.T) {
 			if got, err := extractFromAPKMirror([]byte("<a>Too Good To Go " + version + "</a>")); err == nil {
 				t.Fatalf("accepted malformed version %q as %q", version, got)

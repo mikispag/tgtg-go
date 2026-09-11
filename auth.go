@@ -28,7 +28,7 @@ func (c *Client) storeTokens(tok authTokens, resp httpResponse) {
 // required fields are validated. DataDome acquisition still uses the live jar.
 func (c *Client) postAuth(ctx context.Context, requestURL string, body any) (httpResponse, error) {
 	client := *c.httpClient
-	cookies := &cookieTransaction{base: client.Jar}
+	cookies := &cookieTransaction{base: client.Jar.(*ownedCookieJar)}
 	client.Jar = cookies
 	resp, err := c.postWithClient(ctx, requestURL, body, &client)
 	if err != nil {
