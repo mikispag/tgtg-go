@@ -112,7 +112,7 @@ func fakeTokensConfig() Config {
 	return Config{
 		AccessToken:  "access_token",
 		RefreshToken: "refresh_token",
-		Cookie:       "cookie",
+		Cookie:       "session=initial",
 	}
 }
 
@@ -121,20 +121,20 @@ func (m *mockServer) addRefreshTokensResponse() *int64 {
 	return m.addJSON(http.MethodPost, "/"+RefreshEndpoint, http.StatusOK, map[string]any{
 		"access_token":  "an_access_token",
 		"refresh_token": "a_refresh_token",
-	}, http.Header{"Set-Cookie": {"sweet sweet cookie"}})
+	}, http.Header{"Set-Cookie": {"session=refreshed; Path=/"}})
 }
 
 func TestLoginWithTokens(t *testing.T) {
 	m := newMockServer(t)
 	m.addJSON(http.MethodPost, "/"+RefreshEndpoint, http.StatusOK,
 		map[string]any{"access_token": "test", "refresh_token": "test_"},
-		http.Header{"Set-Cookie": {"sweet sweet cookie"}})
+		http.Header{"Set-Cookie": {"session=refreshed; Path=/"}})
 
 	c := newClient(t, m, fakeTokensConfig())
 	if err := c.Login(context.Background()); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
-	if c.AccessToken != "test" || c.RefreshToken != "test_" || c.Cookie != "sweet sweet cookie" {
+	if c.AccessToken != "test" || c.RefreshToken != "test_" || c.Cookie != "session=refreshed" {
 		t.Fatalf("unexpected credentials: %+v", c)
 	}
 }
@@ -156,7 +156,7 @@ func TestRefreshTokenAfterSomeTime(t *testing.T) {
 
 	m.replaceJSON(http.MethodPost, "/"+RefreshEndpoint, http.StatusOK, map[string]any{
 		"access_token": "new_access_token", "refresh_token": "new_refresh_token",
-	}, http.Header{"Set-Cookie": {"sweet sweet cookie"}})
+	}, http.Header{"Set-Cookie": {"session=refreshed; Path=/"}})
 
 	// Within lifetime: no refresh.
 	cur = base.Add(DefaultAccessTokenLifetime)
@@ -229,7 +229,7 @@ func TestGetCredentials(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetCredentials: %v", err)
 	}
-	want := Credentials{AccessToken: "an_access_token", RefreshToken: "a_refresh_token", Cookie: "sweet sweet cookie"}
+	want := Credentials{AccessToken: "an_access_token", RefreshToken: "a_refresh_token", Cookie: "session=refreshed"}
 	if creds != want {
 		t.Fatalf("got %+v, want %+v", creds, want)
 	}
@@ -770,7 +770,7 @@ func TestPollingSucceedsAfterPin(t *testing.T) {
 		map[string]any{"state": "WAIT", "polling_id": "pid"}, nil)
 	m.addJSON(http.MethodPost, "/"+AuthByRequestPinEndpoint, http.StatusOK,
 		map[string]any{"access_token": "a", "refresh_token": "r"},
-		http.Header{"Set-Cookie": {"yum"}})
+		http.Header{"Set-Cookie": {"session=yum; Path=/"}})
 
 	cfg := Config{
 		Email:     "x@y.com",
@@ -781,7 +781,7 @@ func TestPollingSucceedsAfterPin(t *testing.T) {
 	if err := c.Login(context.Background()); err != nil {
 		t.Fatalf("Login: %v", err)
 	}
-	if c.AccessToken != "a" || c.RefreshToken != "r" || c.Cookie != "yum" {
+	if c.AccessToken != "a" || c.RefreshToken != "r" || c.Cookie != "session=yum" {
 		t.Fatalf("unexpected post-login state: %+v", c)
 	}
 }
@@ -802,7 +802,7 @@ func TestPollingFallback(t *testing.T) {
 				w.WriteHeader(http.StatusAccepted)
 				return
 			}
-			w.Header().Set("Set-Cookie", "yum")
+			w.Header().Set("Set-Cookie", "session=yum; Path=/")
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"access_token": "a", "refresh_token": "r",
@@ -914,7 +914,7 @@ func TestDataDomeCookieInjected(t *testing.T) {
 		calls:  new(int64),
 		handler: func(w http.ResponseWriter, r *http.Request) {
 			gotCookie <- r.Header.Get("Cookie")
-			w.Header().Set("Set-Cookie", "session=ok")
+			w.Header().Set("Set-Cookie", "session=ok; Path=/")
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"access_token": "a", "refresh_token": "r",
@@ -1122,7 +1122,7 @@ func TestRefreshCollapsesMultipleSetCookies(t *testing.T) {
 		handler: func(w http.ResponseWriter, r *http.Request) {
 			// Send TWO Set-Cookie headers; the client must capture both.
 			w.Header().Add("Set-Cookie", "session=abc; Path=/")
-			w.Header().Add("Set-Cookie", "datadome=ddv; Path=/; Secure")
+			w.Header().Add("Set-Cookie", "datadome=ddv; Path=/; HttpOnly")
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"access_token": "a", "refresh_token": "r",
@@ -1148,7 +1148,7 @@ func TestSignupStoresCookie(t *testing.T) {
 		"login_response": map[string]any{
 			"access_token": "a", "refresh_token": "r",
 		},
-	}, http.Header{"Set-Cookie": {"session=signup-cookie"}})
+	}, http.Header{"Set-Cookie": {"session=signup-cookie; Path=/"}})
 	c := newClient(t, m, Config{})
 
 	if err := c.SignupByEmail(context.Background(), DefaultSignupOptions("test@test.com")); err != nil {
@@ -1496,27 +1496,6 @@ func TestNewBuildsUserAgentEagerlyWhenAPKVersionGiven(t *testing.T) {
 	}
 }
 
-// --- collectSetCookie ------------------------------------------------------
-
-func TestCollectSetCookie(t *testing.T) {
-	cases := []struct {
-		name string
-		h    http.Header
-		want string
-	}{
-		{"empty", http.Header{}, ""},
-		{"single", http.Header{"Set-Cookie": {"a=1"}}, "a=1"},
-		{"multi", http.Header{"Set-Cookie": {"a=1", "b=2; Path=/"}}, "a=1, b=2; Path=/"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := collectSetCookie(tc.h); got != tc.want {
-				t.Fatalf("got %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
 // --- Custom HTTPClient -----------------------------------------------------
 
 func TestCustomHTTPClientPropagates(t *testing.T) {
@@ -1693,7 +1672,7 @@ func TestPostLazilyResolvesUserAgent(t *testing.T) {
 	c := New(Config{
 		AccessToken:    "access_token",
 		RefreshToken:   "refresh_token",
-		Cookie:         "cookie",
+		Cookie:         "session=initial",
 		URL:            m.baseURL(),
 		DataDomeSDKURL: m.server.URL + "/datadome",
 		Output:         io.Discard,
@@ -1726,7 +1705,7 @@ func TestPostUsesRequestContextForAPKFetch(t *testing.T) {
 	c := New(Config{
 		AccessToken:    "access_token",
 		RefreshToken:   "refresh_token",
-		Cookie:         "cookie",
+		Cookie:         "session=initial",
 		URL:            m.baseURL(),
 		DataDomeSDKURL: m.server.URL + "/datadome",
 		Output:         io.Discard,
@@ -1757,7 +1736,7 @@ func TestPostFallsBackToDefaultAPKVersionOnFetchError(t *testing.T) {
 	c := New(Config{
 		AccessToken:    "access_token",
 		RefreshToken:   "refresh_token",
-		Cookie:         "cookie",
+		Cookie:         "session=initial",
 		URL:            m.baseURL(),
 		DataDomeSDKURL: m.server.URL + "/datadome",
 		Output:         io.Discard,
@@ -1828,7 +1807,7 @@ func TestRefreshTokenWithGzippedBody(t *testing.T) {
 		handler: func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Content-Encoding", "gzip")
-			w.Header().Set("Set-Cookie", "sweet sweet cookie")
+			w.Header().Set("Set-Cookie", "session=refreshed; Path=/")
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(gzipped)
 		},

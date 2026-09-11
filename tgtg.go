@@ -58,20 +58,7 @@ var reDataDomeCookie = regexp.MustCompile(`datadome=([^;]+)`)
 // fields" enforced by the type system.
 type httpResponse struct {
 	StatusCode int
-	Header     http.Header
 	Body       []byte
-}
-
-// collectSetCookie returns all Set-Cookie headers joined into a single value
-// suitable for round-tripping. The cookiejar handles per-request cookie
-// matching; this string exists so callers can persist credentials and
-// reconstruct a Client later.
-func collectSetCookie(h http.Header) string {
-	values := h.Values("Set-Cookie")
-	if len(values) == 0 {
-		return ""
-	}
-	return strings.Join(values, ", ")
 }
 
 const dataDomeCIDChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789~_"
@@ -207,6 +194,22 @@ func New(cfg Config) *Client {
 		out:               cfg.Output,
 		apkVersionFetcher: cfg.APKVersionFetcher,
 	}
+	if apiURL, err := url.Parse(c.BaseURL); err == nil {
+		// Older versions saved comma-joined Set-Cookie fields, including
+		// response attributes. Accept those as well as normal Cookie headers.
+		saved := &http.Request{Header: http.Header{"Cookie": {strings.ReplaceAll(cfg.Cookie, ",", ";")}}}
+		var cookies []*http.Cookie
+		for _, cookie := range saved.Cookies() {
+			switch strings.ToLower(cookie.Name) {
+			case "path", "domain", "expires", "max-age", "secure", "httponly", "samesite", "partitioned":
+				continue
+			}
+			cookie.Path = "/"
+			cookies = append(cookies, cookie)
+		}
+		c.httpClient.Jar.SetCookies(apiURL, cookies)
+		c.syncCookies()
+	}
 
 	// When the APK version is already known, build the User-Agent eagerly —
 	// no I/O is required. Otherwise defer resolution to the first request,
@@ -246,9 +249,6 @@ func (c *Client) buildHeaders() http.Header {
 	h.Set("Content-Type", "application/json; charset=utf-8")
 	h.Set("User-Agent", c.UserAgent)
 	h.Set("X-Correlation-ID", c.correlationID)
-	if c.Cookie != "" {
-		h.Set("Cookie", c.Cookie)
-	}
 	if c.AccessToken != "" {
 		h.Set("Authorization", "Bearer "+c.AccessToken)
 	}
@@ -301,6 +301,7 @@ func (c *Client) doPost(ctx context.Context, requestURL string, body any) (httpR
 	if err != nil {
 		return httpResponse{}, err
 	}
+	c.syncCookies()
 	defer resp.Body.Close()
 	var bodyReader io.Reader = resp.Body
 	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
@@ -317,7 +318,6 @@ func (c *Client) doPost(ctx context.Context, requestURL string, body any) (httpR
 	}
 	return httpResponse{
 		StatusCode: resp.StatusCode,
-		Header:     resp.Header,
 		Body:       payload,
 	}, nil
 }
@@ -338,6 +338,25 @@ func (c *Client) ensureDataDomeCookie(ctx context.Context, requestURL string) {
 func (c *Client) clearCookies() {
 	jar, _ := cookiejar.New(nil)
 	c.httpClient.Jar = jar
+}
+
+// syncCookies exposes the jar's API cookies as a reusable Cookie header.
+// Keep the last known snapshot while the jar is empty after a 403, so a failed
+// SDK refresh does not discard credentials needed by the next login attempt.
+func (c *Client) syncCookies() {
+	apiURL, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return
+	}
+	cookies := c.httpClient.Jar.Cookies(apiURL)
+	if len(cookies) == 0 {
+		return
+	}
+	snapshot := &http.Request{Header: make(http.Header)}
+	for _, cookie := range cookies {
+		snapshot.AddCookie(cookie)
+	}
+	c.Cookie = snapshot.Header.Get("Cookie")
 }
 
 func (c *Client) fetchDataDomeCookie(ctx context.Context, requestURL string) {
@@ -413,6 +432,7 @@ func (c *Client) fetchDataDomeCookie(ctx context.Context, requestURL string) {
 		Path:   "/",
 		Secure: apiURL.Scheme == "https",
 	}})
+	c.syncCookies()
 }
 
 // Login authenticates the client. The first call requires either an email or a
@@ -477,10 +497,12 @@ func (c *Client) refreshToken(ctx context.Context) error {
 	if err := json.Unmarshal(resp.Body, &tok); err != nil {
 		return &APIError{StatusCode: resp.StatusCode, Body: string(resp.Body)}
 	}
+	if strings.TrimSpace(tok.AccessToken) == "" || strings.TrimSpace(tok.RefreshToken) == "" {
+		return &APIError{StatusCode: resp.StatusCode, Body: "token refresh response is missing access_token or refresh_token"}
+	}
 	c.AccessToken = tok.AccessToken
 	c.RefreshToken = tok.RefreshToken
 	c.LastTimeTokenRefreshed = c.now()
-	c.Cookie = collectSetCookie(resp.Header)
 	return nil
 }
 
@@ -521,7 +543,6 @@ func (c *Client) startPolling(ctx context.Context, pollingID string) error {
 			c.AccessToken = tok.AccessToken
 			c.RefreshToken = tok.RefreshToken
 			c.LastTimeTokenRefreshed = c.now()
-			c.Cookie = collectSetCookie(resp.Header)
 			return nil
 		case http.StatusTooManyRequests:
 			return &APIError{StatusCode: resp.StatusCode, Body: "Too many requests. Try again later."}
@@ -557,7 +578,6 @@ func (c *Client) authByPIN(ctx context.Context, pollingID, pin string) error {
 	c.AccessToken = tok.AccessToken
 	c.RefreshToken = tok.RefreshToken
 	c.LastTimeTokenRefreshed = c.now()
-	c.Cookie = collectSetCookie(resp.Header)
 	return nil
 }
 
@@ -871,7 +891,6 @@ func (c *Client) SignupByEmail(ctx context.Context, opts SignupOptions) error {
 	c.AccessToken = out.LoginResponse.AccessToken
 	c.RefreshToken = out.LoginResponse.RefreshToken
 	c.LastTimeTokenRefreshed = c.now()
-	c.Cookie = collectSetCookie(resp.Header)
 	return nil
 }
 
